@@ -1,5 +1,5 @@
 {
-  "name": "@ericjuta/omp-jev",
+  "name": "@ericjuta/omp-cua-jev",
   "version": "0.1.0",
   "private": true,
   "description": "Guarded computer use with Oh My Pi's configured judge and Cua Driver",
@@ -7,11 +7,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ericjuta/omp-jev.git"
+    "url": "git+https://github.com/ericjuta/omp-cua-jev.git"
   },
-  "homepage": "https://github.com/ericjuta/omp-jev#readme",
+  "homepage": "https://github.com/ericjuta/omp-cua-jev#readme",
   "bugs": {
-    "url": "https://github.com/ericjuta/omp-jev/issues"
+    "url": "https://github.com/ericjuta/omp-cua-jev/issues"
   },
   "engines": {
     "bun": ">=1.3.14"

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { createCuaDriver } from '../src/cua-driver.mjs';
 
 async function createFixture(t, session, steps) {
-  const directory = await mkdtemp(join(tmpdir(), 'omp-jev-driver-'));
+  const directory = await mkdtemp(join(tmpdir(), 'omp-cua-jev-driver-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const executable = join(directory, 'driver.mjs');
   const log = join(directory, 'dispatch.json');

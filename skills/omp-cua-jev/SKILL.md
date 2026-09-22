@@ -1,12 +1,12 @@
 ---
-name: omp-jev
+name: omp-cua-jev
 description: Use OMP's live judge to choose among locally defined, authorized Cua Driver actions in a bounded loop. Covers resource discovery, isolated localhost demos, independent application verification, and owned-session cleanup.
 ---
 
 # Bounded computer use
 
-Locally verified, private, and unpublished. Local verification is not clean-machine acceptance or a speedup claim.
-Publishing remains blocked until the README's acceptance checklist passes on an actual clean supported machine, including fresh app-identity/OS-permission onboarding and ordinary standard-mode operation. A fresh `HOME` on a configured Mac is not sufficient.
+Locally verified on a configured Mac. The GitHub repo is public. npm is not published. Local verification is not clean-machine acceptance or a speedup claim.
+Clean-machine onboarding is still open, including fresh app-identity/OS-permission onboarding and ordinary standard-mode operation. A fresh `HOME` on a configured Mac is not sufficient.
 
 Prefer a purpose-built API, CLI, or deterministic selector. Use Jev when a small set of authorized UI actions needs semantic selection. Local code owns every executable argument; the judge chooses an ID only.
 

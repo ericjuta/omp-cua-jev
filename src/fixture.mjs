@@ -10,10 +10,10 @@ export async function createFixture() {
   let origin;
   let host;
   const html = `<!doctype html>
-<html lang="en"><meta charset="utf-8"><title>omp-jev native demo</title>
+<html lang="en"><meta charset="utf-8"><title>omp-cua-jev native demo</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{font:18px system-ui;max-width:42rem;margin:4rem auto;padding:1rem}label,input,button,output{display:block;margin:1rem 0}input{width:100%;font:inherit}button{font:inherit;padding:.6rem}code{overflow-wrap:anywhere}</style>
-<h1>omp-jev native demo</h1>
+<h1>omp-cua-jev native demo</h1>
 <p>Save this synthetic receipt exactly once: <code>${token}</code></p>
 <form id="form"><label for="receipt">Receipt code</label>
 <input id="receipt" name="receipt" autocomplete="off" required>

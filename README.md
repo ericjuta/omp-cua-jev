@@ -1,4 +1,4 @@
-# omp-jev
+# omp-cua-jev
 
 Use OMP's configured `judge` to choose from a local action table, then execute and verify authorized actions through Cua Driver. The plugin supplies diagnostics, absolute helper paths, a bundled skill, and an isolated localhost demo. It does not install a model client or keep separate credentials.
 
@@ -27,11 +27,11 @@ The native implementation uses the schema contract inspected in Cua Driver `0.28
 4. Clone this repo and link its directory:
 
    ```sh
-   git clone https://github.com/ericjuta/omp-jev.git
-   omp plugin link /absolute/path/to/omp-jev
+   git clone https://github.com/ericjuta/omp-cua-jev.git
+   omp plugin link /absolute/path/to/omp-cua-jev
    ```
 
-   Start a new OMP session. The link must remain available. There is no npm package. `/jev paths` reports the installed resources; `/skill:omp-jev` loads the bundled workflow.
+   Start a new OMP session. The link must remain available. There is no npm package. `/jev paths` reports the installed resources; `/skill:omp-cua-jev` loads the bundled workflow.
 
 ## Set up Cua Driver as a human
 
@@ -105,7 +105,7 @@ These results prove local discovery, host judge integration, and the determinist
 Every item below remains pending for a genuinely clean supported machine, including fresh app-identity/OS-permission onboarding for macOS. The v0.1.0 GitHub release does not check off this list. A fresh `HOME` on an already-configured Mac can test OMP discovery isolation, but **does not satisfy this check**.
 
 - [ ] Record actual Bun, OMP, Cua Driver, OS, and browser versions. Install stock OMP without personal plugins. Complete human authentication and Cua consent using ordinary standard mode, without bypass flags or existing-profile grants.
-- [ ] Link the package directory. Confirm bundled `/skill:omp-jev` discovery and absolute resource imports through `jev_resources` from a working directory outside the checkout. Confirm stock `eval` advertises `language: "js"`.
+- [ ] Link the package directory. Confirm bundled `/skill:omp-cua-jev` discovery and absolute resource imports through `jev_resources` from a working directory outside the checkout. Confirm stock `eval` advertises `language: "js"`.
 - [ ] Save `/jev doctor` output and its limits. Confirm standard mode, but do not label read-only checks as a native or fresh direct-capture proof.
 - [ ] Run the real `/jev probe`. Record its actual decision, including abstention, and helper-level judge-call count. OMP can retry or fall back internally. Keep configured confidence gates unchanged. A valid response is not proof of calibrated confidence or a judge-selected native action.
 - [ ] Run the isolated native demo. Require a newly prepared owned browser, PID-filtered visible-window discovery, exact binding with mutation allowed, and an actual returned tab. Require the fixture's token match, `count: 1`, `attempts: 1`, and rendered confirmation. Record abstention or failure honestly. Deterministic success proves the native path, not judge selection.

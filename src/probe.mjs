@@ -9,7 +9,7 @@ export async function probeJudge(judge) {
       return judge(state, questions);
     },
     goal: 'Keep the synthetic sample. Select keep, or abstain if uncertain.',
-    observation: { id: 'omp-jev:probe', observedAt: Date.now(), state: { sample: 'Synthetic connectivity probe, no external task.' } },
+    observation: { id: 'omp-cua-jev:probe', observedAt: Date.now(), state: { sample: 'Synthetic connectivity probe, no external task.' } },
     candidates: [{ id: 'keep', description: 'Keep the synthetic sample unchanged.', action: { operation: 'keep-synthetic-sample' } }],
   });
   return { decision, judgeCalls, nativeActions: 0,

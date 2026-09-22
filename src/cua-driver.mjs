@@ -188,7 +188,7 @@ export function createCuaDriver(options = {}) {
     if (!isRecord(options)) throw failure();
     ({
       binary = 'cua-driver',
-      session = `omp-jev-${randomUUID()}`,
+      session = `omp-cua-jev-${randomUUID()}`,
       timeoutMs = 20_000,
     } = options);
     if (typeof binary !== 'string' || !binary.trim() || binary.includes('\0')) throw failure();

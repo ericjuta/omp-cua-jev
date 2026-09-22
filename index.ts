@@ -7,7 +7,7 @@ const paths = Object.freeze({
   driver: fileURLToPath(new URL('./src/cua-driver.mjs', import.meta.url)),
   demo: fileURLToPath(new URL('./src/demo.mjs', import.meta.url)),
   probe: fileURLToPath(new URL('./src/probe.mjs', import.meta.url)),
-  skill: fileURLToPath(new URL('./skills/omp-jev/SKILL.md', import.meta.url)),
+  skill: fileURLToPath(new URL('./skills/omp-cua-jev/SKILL.md', import.meta.url)),
 });
 
 export default function jev(pi: ExtensionAPI) {
@@ -44,7 +44,7 @@ export default function jev(pi: ExtensionAPI) {
   pi.registerTool({
     name: 'jev_resources',
     label: 'Jev resources',
-    description: 'Read installed omp-jev helper paths or run read-only prerequisite diagnostics. Never starts sessions, grants permissions, changes settings, or calls a model.',
+    description: 'Read installed omp-cua-jev helper paths or run read-only prerequisite diagnostics. Never starts sessions, grants permissions, changes settings, or calls a model.',
     approval: 'read',
     parameters: Type.Object({ action: Type.Union([Type.Literal('paths'), Type.Literal('doctor')]) }),
     async execute(_id, params) {
@@ -86,7 +86,7 @@ export default function jev(pi: ExtensionAPI) {
         report({ status: 'not_started', reason: 'Use this as an initial eval instruction in print mode, or run the command interactively.', language: 'js', code }, ctx);
         return;
       }
-      pi.sendUserMessage(`Run this omp-jev ${action} using the existing eval tool with language js. Read ${JSON.stringify(paths.skill)} first. Execute only the exact code below, without changing confidence gates, approvals, browser profiles, or targets. Report its actual result, including abstention or incomplete cleanup. Do not call a subprocess model or create credentials. This command authorizes only the bundled synthetic probe or isolated localhost demo.\n\n${code}`);
+      pi.sendUserMessage(`Run this omp-cua-jev ${action} using the existing eval tool with language js. Read ${JSON.stringify(paths.skill)} first. Execute only the exact code below, without changing confidence gates, approvals, browser profiles, or targets. Report its actual result, including abstention or incomplete cleanup. Do not call a subprocess model or create credentials. This command authorizes only the bundled synthetic probe or isolated localhost demo.\n\n${code}`);
     },
   });
 }

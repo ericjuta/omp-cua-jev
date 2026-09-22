@@ -180,7 +180,7 @@ export async function doctor({ host, paths, binary = 'cua-driver' } = {}) {
   const resources = await resourceStatus(paths);
   if (resources.files && Object.values(resources.files).some(state => state !== 'readable')) {
     issue(blocking, 'PACKAGE_RESOURCES_UNAVAILABLE', 'One or more installed helper or skill files are missing or unreadable.',
-      'Inspect jev_resources with action paths and relink the complete package directory using omp plugin link /path/to/omp-jev.');
+      'Inspect jev_resources with action paths and relink the complete package directory using omp plugin link /path/to/omp-cua-jev.');
   }
 
   const validBinary = typeof binary === 'string' && binary.trim().length > 0 && !binary.includes('\0');
