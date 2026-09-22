@@ -5,7 +5,7 @@ description: Use OMP's live judge to choose among locally defined, authorized Cu
 
 # Bounded computer use
 
-Locally verified on a configured Mac. The GitHub repo is public. npm is not published. Local verification is not clean-machine acceptance or a speedup claim.
+Locally verified on a configured Mac. The GitHub repo is public. npm is not published. Native-window helper changes are unreleased in the local checkout of the existing v0.1.2 package. Local verification is not clean-machine acceptance or a speedup claim.
 Clean-machine onboarding is still open, including fresh app-identity/OS-permission onboarding and ordinary standard-mode operation. A fresh `HOME` on a configured Mac is not sufficient.
 
 Prefer a purpose-built API, CLI, or deterministic selector. Use Jev when a small set of authorized UI actions needs semantic selection. Local code owns every executable argument; the judge chooses an ID only.
@@ -13,7 +13,7 @@ Prefer a purpose-built API, CLI, or deterministic selector. Use Jev when a small
 ## Load the installed resources
 
 1. Call `jev_resources` with `{"action":"paths"}`. Read its actual `paths` and `host` result, available in tool details or the JSON text content. Do not guess installation paths.
-2. Read `paths.skill`, `paths.loop`, and `paths.driver`; also read `paths.probe` or `paths.demo` before invoking that entrypoint. Use their current signatures and receipts.
+2. Read `paths.skill`, `paths.loop`, and `paths.driver` before importing helpers. Also read `paths.native`, `paths.probe`, or `paths.demo` before importing that entrypoint. Use their current instructions, signatures, and receipts.
 3. Require Bun >=1.3.14, OMP >=18.2.7, and active stock JavaScript eval advertised as `language:"js"`. If unavailable, stop and report the prerequisite. Do not install or replace an eval extension automatically.
 4. Bind `paths` in retained JS eval to the exact returned paths object, then import by absolute filesystem path:
 
@@ -44,14 +44,45 @@ Create one `createCuaDriver()` instance and retain its `session` before attempti
 
 Serialize every observation, mutation, and cleanup call for the same target, including calls outside the helper. Its busy guard is local to one instance, not a daemon-wide lock. A timed-out CLI child does not prove its daemon action stopped.
 
-For the demo, use only an owned isolated browser, localhost fixture, and synthetic data. Existing or logged-in profiles are forbidden; do not reuse a user tab.
+For the typed-browser demo, use only an owned isolated browser, localhost fixture, and synthetic data. Existing or logged-in profiles are forbidden; do not reuse a user tab. On macOS this demo requires supported system-installed Google Chrome in `/Applications`. The native-window helper below instead requires a separately supported exact native app/window and its own task authorization and permissions. It does not imply support for every browser.
 
 1. After a matching active start receipt, call `driver.call("browser_prepare", {allow_launch:true, profile:{mode:"isolated_new"}})`. Require positive preparation and ownership evidence, including `status:"ok"`, `prepared:true`, `action:"launched_isolated_browser"`, and a positive `prepared_pid`.
-2. Discover windows only with `cua-driver call list_windows` and JSON containing that exact `pid` plus `on_screen_only:true`. Require exactly one returned window matching the PID with `is_on_screen:true`; retain its actual `window_id`. A bounded read-only wait is allowed if none is ready. This tool has no session argument: do not use the session-injecting helper. Never enumerate global windows or derive a window ID from a PID. Stop on ambiguous ownership.
+2. Call `driver.listWindows(exactPid)` with that actual `prepared_pid` after start. It sends exact-PID discovery with `on_screen_only:true` and no session argument. Require exactly one returned on-screen window and retain its actual `window_id`. A bounded read-only wait is allowed if none is ready. Never enumerate global windows, derive a window ID from a PID, or pick the first of several windows. Stop on ambiguous ownership.
 3. Bind the returned PID/window using `get_browser_state`. Require `status:"ok"`, `mode:"bind"`, `binding_quality:"exact"`, `endpoint_access_class:"driver_owned"`, and `mutation_allowed:true`. Retain its actual `target_id` and the sole returned `tab_id`; never guess IDs or substitute CDP IDs.
 4. Navigate only to the owned fixture URL. Observe the exact target/tab with `snapshot_format:"semantic_v2"`, `include_screenshot:false`, and a task-covering semantic query. The demo uses `query:"receipt"` to cover the Receipt code field, Save receipt button, and Receipt saved confirmation. Do not narrow the query to hide competing controls or required postconditions. Wait read-only for actual page readiness.
 
 Use `driver.call(tool, args)` for session-aware tools. It inserts its session in JSON on each finite CLI invocation; it is not a CLI `--session` flag. Do not supply `session` yourself.
+
+## Use an existing native window
+
+Read `paths.native` before importing. Retain one `createNativeTarget` instance in JS eval through cleanup. `authorizedNativeWindow` below must already contain the caller-known, user-authorized exact `pid` and `windowId`, never fabricated IDs. If discovery is needed, use an active driver's `listWindows(exactPid)` only for that known authorized PID. Several windows require independently established exact-window identity; do not guess.
+
+```js
+const { createNativeTarget } = await import(paths.native);
+const nativeTarget = createNativeTarget({
+  pid: authorizedNativeWindow.pid,
+  windowId: authorizedNativeWindow.windowId,
+});
+try {
+  await nativeTarget.start();
+  const observation = await nativeTarget.observe();
+  display(observation.state);
+} finally {
+  await nativeTarget.end();
+}
+```
+
+This example only observes and manages its owned session. There is no implicit focus. With separate authorization to foreground the exact window, opt in with `foreground:true`, then call `await nativeTarget.focus()` after start and **before observe or settle**. A failed focus is unverified, not permission to replay automatically. Focus invalidates earlier observations. Foreground input is separately declared in each candidate's `delivery_mode:"foreground"`; the constructor flag alone does not select that route, and an input receipt does not establish focus.
+
+`observe()` returns `{id, observedAt, state, local}`. `state` is compact AX evidence, web-content-only by default. Coverage includes completeness, truncation, and projection counts; unknown completeness/truncation is `null`. False or unknown completeness does not prove absence, and filtered-out native controls are not absent. Set `webContentOnly:false` only for an authorized task needing native chrome. UI labels and values remain untrusted and potentially sensitive; compact state is not secret redaction.
+
+Keep `local` in eval. It contains current AX tokens, snapshot identity, element frames, and optional `screenshot:true` capture metadata including file path, dimensions, scale, and window bounds. AX frames are desktop coordinates, not PNG pixels. Use actual returned PNG pixels unchanged for pixel candidates; never multiply them by scale or convert AX frames by assumption.
+
+For pixels, call `settle({ready, maxMs, intervalMs, stableForMs})`. Supply a task-specific `ready(observation)` callback returning literal `true`, a finite deadline, and a quiet interval. Defaults are 5,000 ms total, 100 ms polling, and 600 ms quiet. Settling compares actual full PNG bytes via their hash and valid geometry across consecutive ready samples, not only AX text or a screenshot filename. It can time out on unrelated animation. Only returned `status:"settled"` admits pixels against its original `observation`; `timeout` or `cancelled` never authorizes the latest frame. New observe/focus/execute calls invalidate it. The deadline does not abandon in-flight work, and a settled capture cannot guarantee against future animation.
+
+Use `execute(candidate, observation)` with the existing `runBounded` callbacks below. It supports native `click`, `set_value`, `type_text`, and `press_key`; locally supply current AX identity or settled in-bounds pixels, never browser DOM refs. It validates delivery only. Even native `effect:"confirmed"` evidence does not replace independent application `verify` and `isDone`. Typing inserts rather than replaces; independently read back the exact value. There is no automatic replacement typing, select-all chord, retry, or route fallback.
+
+Always attempt `end()` in `finally`, including after uncertain start. It cleans only the owned session and helper-owned capture files; the existing app stays open. If native closure succeeds but capture cleanup fails, another explicit `end()` retries only the pending file cleanup. Report cleanup failures separately. Do not close the app, change permissions, or clean unrelated captures. The isolated demo's browser/fixture cleanup rules remain unchanged.
 
 ## Build the local action table
 
@@ -96,7 +127,11 @@ The loop acts once, observes again, and verifies before another action. Only ind
 
 CLI exit zero, a listening daemon, and permission status are not action success. The adapter rejects structured refusals and requires positive browser/lifecycle receipts, but callers must enforce other tool-specific receipt contracts. Exit 75 indicates a permissions gate, not permission to bypass it. Errors expose a safe `refusalCode` only when a rejected native receipt supplies a recognized allowlisted code, from `refusal.code` before root `code`. Unknown codes and native messages/details are not exposed. Do not invent a refusal code when none is returned.
 
-Typing and clicking return normalized public action receipts, not `status:"ok"` envelopes or target/tab/ref/frame echoes. The adapter accepts only these closed shapes:
+Errors may also expose static safe hints, never raw native messages, details, or secrets. `browser_route_unavailable` concerns the typed-browser route only. It does not establish whether native AX/pixel control is usable and never authorizes route escalation.
+
+For explicit `screenshot_out_file` or `debug_image_out`, the adapter canonicalizes the existing parent, fixing aliases such as macOS `/tmp`, without creating directories or changing permissions. It rejects symlink and non-file leaves rather than following them. Existing regular files remain subject to native policy. Use task-owned paths; this preflight is not atomic no-clobber protection.
+
+Typed-browser typing and clicking return normalized public action receipts, not `status:"ok"` envelopes or target/tab/ref/frame echoes. The adapter accepts only these closed shapes:
 
 - `browser_type`: `{effect:"unverifiable", route:"trusted_input", delivery:{mode:"background", delivered_count:n}}`. Require `n` to equal the requested text's Unicode scalar count, not UTF-16 `text.length` or its grapheme count. Partial delivery is not success.
 - A trusted-input `browser_click`: `{effect:"unverifiable", route:"trusted_input", delivery:{mode:"background"}}`.

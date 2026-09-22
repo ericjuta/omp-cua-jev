@@ -1,6 +1,6 @@
 {
   "name": "@ericjuta/omp-cua-jev",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "private": true,
   "description": "Guarded computer use with Oh My Pi's configured judge and Cua Driver",
   "type": "module",
@@ -26,6 +26,7 @@
   "exports": {
     "./loop": "./src/jev-loop.mjs",
     "./driver": "./src/cua-driver.mjs",
+    "./native": "./src/native-target.mjs",
     "./demo": "./src/demo.mjs",
     "./probe": "./src/probe.mjs"
   },

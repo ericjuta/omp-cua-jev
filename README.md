@@ -2,13 +2,13 @@
 
 Use OMP's configured `judge` to choose from a local action table, then execute and verify authorized actions through Cua Driver. The plugin supplies diagnostics, absolute helper paths, a bundled skill, and an isolated localhost demo. It does not install a model client or keep separate credentials.
 
-**Status: v0.1.1 on GitHub.** Local stock-host, judge, and native demo results are recorded below. Clean-machine onboarding is still open. There is no npm package.
+**Version: v0.2.0.** Includes the native-window helper. Local results are recorded below. Clean-machine onboarding is still open. There is no npm package.
 
 ## Requirements
 
 - Bun **1.3.14 or later** and OMP **18.2.7 or later**. `/jev doctor` compares the advertised host version with this minimum. Package-manager metadata does not enforce the OMP requirement.
 - Active stock JavaScript `eval`, with `language: "js"`, and a working OMP model/auth configuration.
-- Cua Driver, a logged-in graphical desktop, and a supported system-installed Chromium browser. On macOS, use macOS 14 or later and Google Chrome in `/Applications`. A cached test browser, Safari, or Firefox is not a substitute for this typed-browser demo.
+- Cua Driver and a logged-in graphical desktop. On macOS, use macOS 14 or later. The typed-browser demo specifically requires supported system-installed Google Chrome in `/Applications`; a cached test browser, Safari, or Firefox is not a substitute. The native-window helper instead requires a separately supported, explicitly authorized exact native app/window. It does not promise support for every browser or remove permission requirements.
 
 The native implementation uses the schema contract inspected in Cua Driver `0.28.3-nightly.20260919.35421378483`. The local verification below is not a tested minimum or a compatibility claim for other builds.
 
@@ -27,7 +27,7 @@ The native implementation uses the schema contract inspected in Cua Driver `0.28
 4. Install the pinned Git tag. Quote it so the shell does not eat the `#`:
 
    ```sh
-   omp plugin install 'github:ericjuta/omp-cua-jev#v0.1.2'
+   omp plugin install 'github:ericjuta/omp-cua-jev#v0.2.0'
    ```
 
    Start a new OMP session. There is no npm package. To work on a local checkout instead, clone the repo and run `omp plugin link /absolute/path/to/omp-cua-jev`. `/jev paths` reports the installed resources; `/skill:omp-cua-jev` loads the bundled workflow.
@@ -64,7 +64,7 @@ Doctor invokes only Cua `--version`, `status`, and `permissions status --json`. 
 
 ## Use the helpers in stock eval
 
-Call `jev_resources` with `{"action":"paths"}`. Its result contains `paths.loop`, `paths.driver`, `paths.demo`, `paths.probe`, and `paths.skill`. Read the returned skill path. Bind the returned `paths` object in the retained JS cell, then import the actual absolute filesystem paths:
+Call `jev_resources` with `{"action":"paths"}`. Its result contains `paths.loop`, `paths.driver`, `paths.native`, `paths.demo`, `paths.probe`, and `paths.skill`. Read `paths.skill` and each helper's instructions/source before importing it, including `paths.native` for native-window work. Bind the returned `paths` object in the retained JS cell, then import the actual absolute filesystem paths:
 
 ```js
 const { chooseAction, runBounded } = await import(paths.loop);
@@ -81,14 +81,49 @@ For custom tasks, follow the bundled skill. Keep executable action arguments loc
 
 Native delivery and application completion are separate. The localhost demo must verify its unique token with exactly one server receipt and one submission attempt, then observe the rendered `Receipt saved` confirmation. A positive Cua click receipt alone is insufficient. Always attempt to end the owned session in `finally` and close the owned fixture. A matching inactive-session receipt confirms lifecycle teardown, **not** that every browser process exited or every profile file was removed. Physical cleanup needs separate, ownership-scoped evidence; never guess profile paths or kill unrelated browsers.
 
+## Use an existing native window
+
+Retain one target in stock JS eval. In this read-only example, `authorizedNativeWindow` must already contain the caller-known, user-authorized `pid` and `windowId`; do not invent IDs or discover global windows. Read `paths.native` before importing:
+
+```js
+const { createNativeTarget } = await import(paths.native);
+const nativeTarget = createNativeTarget({
+  pid: authorizedNativeWindow.pid,
+  windowId: authorizedNativeWindow.windowId,
+});
+try {
+  await nativeTarget.start();
+  const observation = await nativeTarget.observe();
+  display(observation.state);
+} finally {
+  await nativeTarget.end();
+}
+```
+
+There is no implicit focus. If separately authorized to foreground the exact window, construct with `foreground:true` and call `await nativeTarget.focus()` after start and **before observing**. Focus failure is unverified; stop without automatic replay. Foreground input must also be explicitly declared as `delivery_mode:"foreground"` in the local candidate. A delivery receipt does not prove focus.
+
+`observe()` returns compact `state`, web-content-only by default, and retained `local` evidence. False or unknown completeness does not prove a control absent; filtering and truncation can omit controls. Use `webContentOnly:false` only when the authorized task needs native chrome. `local` holds current AX tokens and, with `screenshot:true`, the capture path, dimensions, scale, and geometry. AX frames use desktop coordinates; PNG pixels are a different coordinate space. Do not derive pixel targets from AX frames or multiply PNG coordinates by scale.
+
+`settle({ready, maxMs, intervalMs, stableForMs})` requires a task-specific readiness callback returning literal `true`, a finite deadline, and a quiet interval of identical actual full PNG captures and geometry. Only returned `status:"settled"` admits pixel actions using its original observation. Timeout or cancellation never authorizes the latest frame. A new observation, focus, or execute invalidates that evidence. Settling cannot guarantee against future animation.
+
+`execute(candidate, observation)` checks delivery only. Use the existing `runBounded` authorization and independent application `verify`/`isDone` callbacks; even a confirmed native receipt is not task completion. Typing inserts, not replaces. There is no automatic replacement typing, select-all chord, replay, or route fallback. `end()` ends the owned session and removes only helper-owned captures; the existing app stays open. The isolated demo's separate browser/fixture cleanup remains unchanged.
+
 ## Troubleshooting native evidence
 
 - Normalized `browser_type` and `browser_click` receipts need not contain `status`, target, or tab fields. The tested typing receipt uses `route: "trusted_input"` and a `delivery.delivered_count` matching the requested text. The demo's `dom_event` click returns `route: "dom"` and `escalation: { target: "page", reason: "effect_unconfirmed" }`. Both report background delivery and `effect: "unverifiable"`. The adapter validates these request-specific shapes; independent readback proves completion. Do not replay a mutation because its receipt lacks an expected wrapper.
-- Discover windows with `list_windows` using only the returned `prepared_pid` and `on_screen_only: true`, without a session argument. Require one visible window, exact binding, and an actual returned tab. Hidden helper windows are not targets; multiple visible windows remain ambiguous.
+- Discover windows through an active `driver.listWindows(exactPid)`, using the actual `prepared_pid` for the demo or a separately caller-known authorized PID. The adapter sends exact-PID, on-screen-only discovery without a session argument. Never enumerate global windows. Require exactly one visible window for the demo, exact binding, and an actual returned tab. A bounded read-only wait is allowed for no window; multiple windows require an independently known exact authorized window ID, not guessing or taking the first result.
+- `browser_route_unavailable` applies to the typed-browser route. It does not prove native AX/pixel control unusable and does not authorize route escalation. Errors expose only allowlisted refusal codes and static safe hints, not native messages, details, or secrets.
+- Explicit `screenshot_out_file` and `debug_image_out` paths canonicalize their existing parent, including the macOS `/tmp` alias. This creates no directories, changes no permissions, and rejects symlink or non-file leaves. Use task-owned output locations. Existing regular files remain subject to native policy; preflight is not atomic no-clobber protection.
 - The demo queries `receipt`. Collection completeness alone is insufficient: require no continuation, matching selected/total/ref counts, and visible main-frame evidence for every match. Hidden, occluded, budget-omitted, or unprovable-frame evidence blocks action. Document-wide `unknown` or `offscreen` counters alone need not invalidate a fully covered, visible query. Never infer a missing control from an incomplete query.
 - A complete collection can still fail `SEMANTIC_SNAPSHOT_INCOMPLETE` when a required control is `near_viewport`. The bundled fixture uses a compact, left-aligned single-column layout to keep its controls and confirmation visible in smaller viewports. Keep the `in_viewport` requirement; native window dimensions do not establish the CSS viewport dimensions.
 
-## Local verification, 2026-09-21
+## Local native smoke, 2026-09-22
+
+The authorized fixture received one AX Animate action, a bounded settled capture, and one foreground pixel click. Independent DOM/main-page readback reported `starts:1`, `clicks:1`, and `settled:true`, with rendered confirmation. A fresh Bun runtime also verified the source helper's exact-window `focus()` with matching PID/window and all exact-window effect checks true, followed by an inactive session receipt. Earlier retained OMP eval focus attempts were unverified; this is not a claim that those attempts succeeded. No automatic retry or lowered gate was added.
+
+Comet evidence covers scoped read-only observation and capture, not ticket mutations. The final suite passed all 42 tests. Five deliberate mutations failed their regression checks in disposable copies: wrong-window focus acceptance, lost refusal diagnostics, unsettled pixel admission, failed-process acceptance, and broken cleanup retry. Review fixes also keep capture timestamps ahead of file processing and allow pending capture cleanup to retry without ending an already-closed native session again.
+
+## Historical local verification, 2026-09-21
 
 Tested with Bun `1.4.0`, stock OMP `18.2.7`, and Cua Driver `0.28.3-nightly.20260919.35421378483` on an already-configured Mac running macOS `26.5.2`, build `25F84`, with system Google Chrome `153.0.8010.52`. Retained evidence is in `~/.local/state/omp-jev/verification-2026-09-21`.
 

@@ -5,6 +5,7 @@ import { doctor } from './src/doctor.mjs';
 const paths = Object.freeze({
   loop: fileURLToPath(new URL('./src/jev-loop.mjs', import.meta.url)),
   driver: fileURLToPath(new URL('./src/cua-driver.mjs', import.meta.url)),
+  native: fileURLToPath(new URL('./src/native-target.mjs', import.meta.url)),
   demo: fileURLToPath(new URL('./src/demo.mjs', import.meta.url)),
   probe: fileURLToPath(new URL('./src/probe.mjs', import.meta.url)),
   skill: fileURLToPath(new URL('./skills/omp-cua-jev/SKILL.md', import.meta.url)),

@@ -68,11 +68,10 @@ function positiveReply(value) {
     && value.status !== 'error' && value.status !== 'refused';
 }
 
-async function ownedWindow(binary, pid, recordWindows) {
+async function ownedWindow(driver, pid, recordWindows) {
   const deadline = performance.now() + READ_WAIT_MS;
   for (;;) {
-    // list_windows explicitly has NO session parameter. Never enumerate globally.
-    const result = JSON.parse(await readCLI(binary, ['call', 'list_windows', JSON.stringify({ pid, on_screen_only: true })]));
+    const result = await driver.listWindows(pid);
     requireThat(positiveReply(result) && Array.isArray(result.windows), 'INVALID_WINDOW_RECEIPT');
     requireThat(result.windows.every(window => record(window) && window.pid === pid
       && window.is_on_screen === true && natural(window.window_id)), 'WINDOW_SCOPE_MISMATCH');
@@ -375,7 +374,7 @@ export async function runDemo({ judge = unavailableJudge, onProgress, binary = '
       ownership = await observePreparedBrowser(preparedPID);
       cleanup.physical.before = ownership.evidence;
     }, true);
-    native.window = await at('list_owned_windows', () => ownedWindow(binary, preparedPID,
+    native.window = await at('list_owned_windows', () => ownedWindow(driver, preparedPID,
       windows => { native.windows = windows; }));
     const bound = await at('bind_owned_window', () => driver.call('get_browser_state', {
       ...native.window, snapshot_format: 'semantic_v2', include_screenshot: false,
