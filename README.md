@@ -27,7 +27,7 @@ The native implementation uses the schema contract inspected in Cua Driver `0.28
 4. Install the pinned Git tag. Quote it so the shell does not eat the `#`:
 
    ```sh
-   omp plugin install 'github:ericjuta/omp-cua-jev#v0.1.1'
+   omp plugin install 'github:ericjuta/omp-cua-jev#v0.1.2'
    ```
 
    Start a new OMP session. There is no npm package. To work on a local checkout instead, clone the repo and run `omp plugin link /absolute/path/to/omp-cua-jev`. `/jev paths` reports the installed resources; `/skill:omp-cua-jev` loads the bundled workflow.
@@ -86,6 +86,7 @@ Native delivery and application completion are separate. The localhost demo must
 - Normalized `browser_type` and `browser_click` receipts need not contain `status`, target, or tab fields. The tested typing receipt uses `route: "trusted_input"` and a `delivery.delivered_count` matching the requested text. The demo's `dom_event` click returns `route: "dom"` and `escalation: { target: "page", reason: "effect_unconfirmed" }`. Both report background delivery and `effect: "unverifiable"`. The adapter validates these request-specific shapes; independent readback proves completion. Do not replay a mutation because its receipt lacks an expected wrapper.
 - Discover windows with `list_windows` using only the returned `prepared_pid` and `on_screen_only: true`, without a session argument. Require one visible window, exact binding, and an actual returned tab. Hidden helper windows are not targets; multiple visible windows remain ambiguous.
 - The demo queries `receipt`. Collection completeness alone is insufficient: require no continuation, matching selected/total/ref counts, and visible main-frame evidence for every match. Hidden, occluded, budget-omitted, or unprovable-frame evidence blocks action. Document-wide `unknown` or `offscreen` counters alone need not invalidate a fully covered, visible query. Never infer a missing control from an incomplete query.
+- A complete collection can still fail `SEMANTIC_SNAPSHOT_INCOMPLETE` when a required control is `near_viewport`. The bundled fixture uses a compact, left-aligned single-column layout to keep its controls and confirmation visible in smaller viewports. Keep the `in_viewport` requirement; native window dimensions do not establish the CSS viewport dimensions.
 
 ## Local verification, 2026-09-21
 

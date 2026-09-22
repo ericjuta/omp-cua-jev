@@ -12,7 +12,7 @@ export async function createFixture() {
   const html = `<!doctype html>
 <html lang="en"><meta charset="utf-8"><title>omp-cua-jev native demo</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<style>body{font:18px system-ui;max-width:42rem;margin:4rem auto;padding:1rem}label,input,button,output{display:block;margin:1rem 0}input{width:100%;font:inherit}button{font:inherit;padding:.6rem}code{overflow-wrap:anywhere}</style>
+<style>*{box-sizing:border-box}body{font:16px/1.2 system-ui;max-width:28rem;margin:0;padding:.5rem}h1{font-size:1.1rem;margin:0 0 .25rem}p{margin:0 0 .25rem}form{display:grid;grid-template-columns:minmax(0,1fr);gap:.25rem}label,input,button{margin:0}input,button{min-width:0;font:inherit;padding:.25rem .375rem}input{width:100%}button{justify-self:start}output{display:block;margin-top:.25rem}code{overflow-wrap:anywhere}</style>
 <h1>omp-cua-jev native demo</h1>
 <p>Save this synthetic receipt exactly once: <code>${token}</code></p>
 <form id="form"><label for="receipt">Receipt code</label>
