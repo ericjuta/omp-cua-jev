@@ -2,7 +2,7 @@
 
 Use OMP's configured `judge` to choose from a local action table, then execute and verify authorized actions through Cua Driver. The plugin supplies diagnostics, absolute helper paths, a bundled skill, and an isolated localhost demo. It does not install a model client or keep separate credentials.
 
-**Status: v0.1.0 on GitHub.** Local stock-host, judge, and native demo results are recorded below. Clean-machine onboarding is still open. There is no npm package.
+**Status: v0.1.1 on GitHub.** Local stock-host, judge, and native demo results are recorded below. Clean-machine onboarding is still open. There is no npm package.
 
 ## Requirements
 
@@ -24,14 +24,13 @@ The native implementation uses the schema contract inspected in Cua Driver `0.28
 
 3. Keep stock JS eval enabled. `eval.js` defaults to `true`; `PI_JS=0` disables it. If you deliberately disabled it, review that choice before changing it. No alternate eval plugin is required or installed. See [stock eval](https://github.com/can1357/oh-my-pi/blob/v18.2.7/docs/tools/eval.md).
 
-4. Clone this repo and link its directory:
+4. Install the pinned Git tag. Quote it so the shell does not eat the `#`:
 
    ```sh
-   git clone https://github.com/ericjuta/omp-cua-jev.git
-   omp plugin link /absolute/path/to/omp-cua-jev
+   omp plugin install 'github:ericjuta/omp-cua-jev#v0.1.1'
    ```
 
-   Start a new OMP session. The link must remain available. There is no npm package. `/jev paths` reports the installed resources; `/skill:omp-cua-jev` loads the bundled workflow.
+   Start a new OMP session. There is no npm package. To work on a local checkout instead, clone the repo and run `omp plugin link /absolute/path/to/omp-cua-jev`. `/jev paths` reports the installed resources; `/skill:omp-cua-jev` loads the bundled workflow.
 
 ## Set up Cua Driver as a human
 
