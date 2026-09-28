@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { isProxy } from 'node:util/types';
 import { createCuaDriver } from './cua-driver.mjs';
+import { journalDirectory, ownedCaptureDirectory, readEntry } from './journal.mjs';
+import { decodePng, findRegions } from './pixels.mjs';
 
 const positiveInteger = value => Number.isSafeInteger(value) && value > 0;
 const own = (value, key) => Object.hasOwn(value, key);
@@ -14,19 +16,53 @@ const LOCAL_ELEMENT_FIELDS = [...ELEMENT_FIELDS, 'element_token', 'frame'];
 const OBSERVE_FIELDS = new Set(['screenshot', 'webContentOnly', 'include_accessibility_tree',
   'query', 'max_elements', 'max_depth', 'max_dimension']);
 const ACTION_FIELDS = {
-  click: new Set(['element_token', 'element_index', 'snapshot_id', 'x', 'y', 'button', 'count']),
+  click: new Set(['element_token', 'element_index', 'snapshot_id', 'x', 'y', 'button', 'count', 'capture_id']),
   set_value: new Set(['element_token', 'element_index', 'snapshot_id', 'value']),
   type_text: new Set(['text', 'element_token', 'element_index', 'snapshot_id']),
   press_key: new Set(['key', 'element_token', 'element_index', 'snapshot_id']),
 };
-function requireThat(condition, message, unknownOutcome = false) {
+const VERIFY_FIELDS = new Set(['expect', 'timeoutMs', 'stableSamples']);
+const VERIFY_STATUSES = new Set(['satisfied', 'unsatisfied', 'unknown']);
+// Native reason codes only; free-form native text is never returned.
+const REASON_CODE = /^[a-z][a-z0-9_]{0,63}$/;
+const BOUNDS = ['x', 'y', 'width', 'height'];
+const CAPTURE_PREFIX = 'omp-cua-jev-native-';
+function requireThat(condition, message, unknownOutcome = false, reason) {
   if (!condition) throw Object.assign(new Error(`Native target: ${message}`), {
-    code: 'NATIVE_TARGET_ERROR', unknownOutcome,
+    code: 'NATIVE_TARGET_ERROR', unknownOutcome, ...(reason === undefined ? {} : { reason }),
   });
 }
 async function ownedFile(operation) {
   try { return await operation(); }
   catch { requireThat(false, 'Owned capture file operation failed.'); }
+}
+// Every bound within one point of the capture's window_bounds.
+function sameBounds(bounds, expected) {
+  return bounds !== null && typeof bounds === 'object' &&
+    BOUNDS.every(key => Number.isFinite(bounds[key]) && Math.abs(bounds[key] - expected[key]) <= 1);
+}
+// Inclusive edges. Unreadable bounds cannot prove that a window misses the point.
+function containsPoint(bounds, x, y) {
+  if (bounds === null || typeof bounds !== 'object' || !BOUNDS.every(key => Number.isFinite(bounds[key]))) return true;
+  return x >= bounds.x && x <= bounds.x + bounds.width && y >= bounds.y && y <= bounds.y + bounds.height;
+}
+// Inclusive edges: outer spans every edge of inner.
+function containsBounds(outer, inner) {
+  return [outer, inner].every(bounds => bounds !== null && typeof bounds === 'object' &&
+    BOUNDS.every(key => Number.isFinite(bounds[key]))) &&
+    outer.x <= inner.x && outer.y <= inner.y &&
+    outer.x + outer.width >= inner.x + inner.width && outer.y + outer.height >= inner.y + inner.height;
+}
+// Guard reads dispatch no action. Keep only the driver's validated tool name and allowlisted refusal code.
+async function guardRead(read, unknownOutcome = false, reason = 'guard_unavailable') {
+  try { return await read(); }
+  catch (error) {
+    const driverError = error?.code === 'CUA_DRIVER_ERROR';
+    const safe = key => driverError && typeof error[key] === 'string' && REASON_CODE.test(error[key]) ? { [key]: error[key] } : {};
+    throw Object.assign(new Error('Native target: Pixel guard evidence is unavailable.'), {
+      code: 'NATIVE_TARGET_ERROR', unknownOutcome, reason, ...safe('tool'), ...safe('refusalCode'),
+    });
+  }
 }
 // Inspect data properties before reading caller arguments, including cross-realm OMP objects.
 function record(value) {
@@ -98,16 +134,32 @@ function geometry(screenshot) {
 /**
  * One existing, exact native window. Options: positive integer pid/windowId;
  * foreground=false permits no foreground delivery or focus; maxAgeMs=15000.
- * binary/session/timeoutMs pass to createCuaDriver. Start once, always end in
- * finally even after uncertain start. End removes only this helper's captures,
- * never closes the existing app. Driver errors pass through unchanged.
+ * binary/session/timeoutMs/journal/journalDir pass to createCuaDriver. Single
+ * use: call start() or resume() once and always end in finally, even after an
+ * uncertain start/resume. End removes only this helper's captures, never closes
+ * the existing app. When the driver refuses a first resume(), nothing was
+ * adopted (get_session is read-only): end() sends nothing and resolves null, so
+ * try/finally surfaces the resume error. If the driver adopted the session but a
+ * later local resume step failed, end() closes it like any started session.
+ * Driver and pixel decoder errors pass through unchanged, except pixel guard
+ * reads (below).
+ *
+ * start() authorizes observation only after the driver session starts and the
+ * exact {pid,windowId} target is recorded via driver.recordOwnership. resume()
+ * does the same through driver.resume() for a caller-supplied session label;
+ * unless journal is false it adopts the journal captureDirectory only when
+ * journal.ownedCaptureDirectory returns that exact spelling (a user-owned
+ * directory directly under realpath(tmpdir()) named omp-cua-jev-native-*, not a
+ * symlink alias); otherwise it ignores it. A new capture directory is recorded
+ * with the target before any capture dispatches.
  *
  * observe({screenshot=false,webContentOnly=true,include_accessibility_tree=true,
  * max_elements=2000,max_depth=25,query?,max_dimension?}) returns frozen plain JSON
  * {id,observedAt,state,local}. state holds compact AX fields and coverage, with
  * unknown completeness/truncation as null. local retains exact pid/window_id,
  * snapshot_id when present, elements with element_token/frame, and screenshot
- * {file_path,width,height,scale,window_bounds,frame_valid,byte_length,sha256}.
+ * {file_path,capture_id,width,height,scale,window_bounds,frame_valid,byte_length,
+ * sha256}. capture_id is the native single-use capture binding string or null.
  * The file holds original captured bytes until end. AX frames are desktop
  * coordinates, NOT screenshot pixels. Never derive pixel candidates from them.
  *
@@ -119,8 +171,8 @@ function geometry(screenshot) {
  * not abandon in-flight work. Returns {status,observation,samples}, status one
  * of settled/timeout/cancelled. Only the final settled original observation can
  * authorize pixels, and any next observation/focus/execute invalidates it.
- * IDs and settling are local evidence, not native capture binding. Serialize
- * all work for this window, including calls through other driver instances.
+ * Observation IDs and settling are local evidence; capture_id is the native
+ * binding. Serialize all work for this window, including other driver instances.
  *
  * execute({action:{tool,args}}, observation) supports native click, set_value,
  * type_text, press_key. It supplies exact pid/window_id; mismatched scope is
@@ -130,23 +182,70 @@ function geometry(screenshot) {
  * AND in the candidate. set_value has no delivery_mode argument. AX clicks are
  * single left AXPress only. Pixel clicks may specify button/count. type_text
  * takes text; press_key takes key; both may carry a current AX identity. Other
- * native arguments are intentionally unsupported. Native pixel hit-testing and
- * typing can themselves choose AX or event delivery. The helper never retries
- * or chooses another tool/route. Confirmed receipts require native evidence;
- * event typing requires a full Unicode scalar count. Atomic AX typing may omit
- * the count, but any supplied count must be full. Typing inserts, not replaces.
+ * native arguments are intentionally unsupported. Native typing can itself
+ * choose AX or event delivery. The helper never retries or chooses another
+ * tool/route. Receipts return frozen without native summary text. Pixel clicks
+ * also require a string capture_id, always sent (a caller copy must match); the
+ * Driver consumes that single-use, session-scoped capture on dispatch, so each
+ * pixel action needs its own fresh settle() in this session. Pixel clicks also
+ * require a geometry guard: before dispatch the exact-pid window list must show
+ * windowId with bounds within 1 point of the capture's window_bounds.
+ * Foreground pixels are main-display only. Their screen point (bounds.x +
+ * x*bounds.width/width, likewise y; never via screenshot scale), derived from
+ * both the capture's and the current bounds, must lie in [0,width) x
+ * [0,height) of driver.screenSize(); a window may extend off the display.
+ * Then the on-screen list must show the target and no other window whose
+ * bounds contain either point (inclusive edges) unless both z_index values are
+ * integers and the other's is lower. Only a driver_owned:true record whose
+ * bounds cover the whole main display (Cua Driver's own click-through overlay)
+ * is ignored; driver-owned cards such as approvals, however large, and unknown
+ * ownership still occlude. Guard order: exact list, screenSize, on-screen
+ * list, click. Refusals dispatch no click and throw NATIVE_TARGET_ERROR
+ * unknownOutcome:false with reason target_missing, target_moved,
+ * target_offscreen or target_occluded. A failed guard read does the same with
+ * reason guard_unavailable, keeping only the driver's tool and refusalCode.
+ * For foreground pixels, call focus() and then settle() so the target is
+ * topmost at the point. Pixel clicks accept only the event route: an
+ * accessibility route throws unknownOutcome:true reason
+ * pixel_routed_to_accessibility. After an accepted receipt the bounds are
+ * re-read: a missing or moved window throws unknownOutcome:true reason
+ * target_moved_during_dispatch, and a failed re-read reason
+ * guard_unavailable_after_dispatch. Confirmed receipts
+ * require native evidence; event typing requires a full Unicode scalar count.
+ * Atomic AX typing may omit the count, but any supplied count must be full.
+ * Typing inserts, not replaces.
  * Delivery is not completion: runBounded callers must independently verify the
  * exact application postcondition, including field value after either typing
  * route. Foreground receipts do not prove focus; use focus before observing.
+ *
+ * verify({expect,timeoutMs=5000,stableSamples=2}) with 1-8 predicates,
+ * timeoutMs 0-10000 and stableSamples 1-5 runs verify_state on the exact
+ * pid/window, invalidates current evidence, and returns frozen
+ * {status,stable,samples,elapsedMs,predicates:[{index,status,unknownReason?}]}.
+ * Only status 'satisfied' means satisfied: the literal native status with every
+ * requested predicate satisfied. Unrecognized statuses become 'unknown';
+ * unknownReason keeps only native reason codes; observed values are dropped.
+ *
+ * regions(observation, {match,minArea,maxRegions,connectivity}) re-reads the
+ * owned capture of an observation produced here, requires its recorded
+ * byte_length and sha256, decodes those same bytes, requires the recorded
+ * width/height, and returns frozen pixels.findRegions {regions,truncated} plus
+ * {capture_id,width,height}. It neither invalidates evidence nor authorizes an
+ * action; anchors are capture pixels for that same observation.
  */
 export function createNativeTarget(options = {}) {
   record(options);
-  const { pid, windowId, foreground = false, maxAgeMs = 15000 } = options;
+  const { pid, windowId, foreground = false, maxAgeMs = 15000, journal, journalDir } = options;
   requireThat(positiveInteger(pid) && positiveInteger(windowId) && typeof foreground === 'boolean' &&
     Number.isFinite(maxAgeMs) && maxAgeMs >= 0, 'Invalid target options.');
-  const driver = createCuaDriver(pick(options, ['binary', 'session', 'timeoutMs']));
+  const driver = createCuaDriver(pick(options, ['binary', 'session', 'timeoutMs', 'journal', 'journalDir']));
+  // The driver has already validated and resolved these same inputs.
+  const journalPath = journal === false ? undefined : journalDirectory(journalDir);
   const instance = randomUUID();
-  let busy = false, active = false, generation = 0, current = null, directory = null, endReceipt = null;
+  let busy = false, active = false, generation = 0, current = null, directory = null, recorded = null, endReceipt = null;
+  // 'new' until start() or resume() is first attempted; 'unadopted' once the driver refused that first resume().
+  let lifecycle = 'new';
+  const issued = new WeakSet();
   function invalidate() { generation += 1; current = null; }
   async function operate(callback) {
     requireThat(!busy, 'Concurrent target operation.');
@@ -160,9 +259,14 @@ export function createNativeTarget(options = {}) {
     let path;
     if (screenshot) {
       await ownedFile(async () => {
-        if (!directory) directory = await mkdtemp(join(tmpdir(), 'omp-cua-jev-native-'));
-        directory = await realpath(directory);
+        if (!directory) directory = await realpath(await mkdtemp(join(tmpdir(), CAPTURE_PREFIX)));
+        else if (await realpath(directory) !== directory) throw new Error('Owned capture directory moved.');
       });
+      // Journal the directory before any capture can land in it; a failed record retries next capture.
+      if (recorded !== directory) {
+        await driver.recordOwnership({ target: { pid, windowId }, captureDirectory: directory });
+        recorded = directory;
+      }
       path = join(directory, `${randomUUID()}.png`);
       args.screenshot_out_file = path;
     }
@@ -174,7 +278,9 @@ export function createNativeTarget(options = {}) {
       requireThat(reply.screenshot_file_path === path && await ownedFile(() => realpath(path)) === path, 'Capture is not the owned file.');
       const bytes = await ownedFile(() => readFile(path));
       requireThat(bytes.length > 0, 'Empty capture.');
-      local.screenshot = { file_path: path, width: reply.screenshot_width ?? null,
+      local.screenshot = { file_path: path,
+        capture_id: typeof reply.capture_id === 'string' && reply.capture_id !== '' ? reply.capture_id : null,
+        width: reply.screenshot_width ?? null,
         height: reply.screenshot_height ?? null, scale: reply.screenshot_scale ?? null,
         window_bounds: reply.window_bounds ? pick(reply.window_bounds, ['x', 'y', 'width', 'height']) : null,
         frame_valid: reply.screenshot_frame_valid ?? null, byte_length: bytes.length,
@@ -183,6 +289,7 @@ export function createNativeTarget(options = {}) {
     const observation = freeze({ id: `${driver.session}/${pid}/${windowId}/${instance}/${generation}/${reply.snapshot_id ?? 'capture'}`,
       observedAt, state, local });
     current = { observation, capturedAt, generation, settled: false };
+    issued.add(observation);
     return observation;
   }
   async function settle(options = {}) {
@@ -236,8 +343,10 @@ export function createNativeTarget(options = {}) {
       requireThat(mode === 'background' || (mode === 'foreground' && foreground), 'Foreground delivery is not enabled.');
       const hasElement = ['element_token', 'element_index', 'snapshot_id'].some(key => own(args, key));
       const pixels = own(args, 'x') || own(args, 'y');
+      const pixelClick = tool === 'click' && !hasElement;
+      const image = observation.local.screenshot;
       if (hasElement) {
-        requireThat(!pixels, 'Mixed AX and pixel addressing.');
+        requireThat(!pixels && !own(args, 'capture_id'), 'Mixed AX and pixel addressing.');
         const matches = observation.local.elements.filter(element =>
           (own(args, 'element_token') ? typeof args.element_token === 'string' && element.element_token === args.element_token
             : own(args, 'snapshot_id') && args.snapshot_id === observation.local.snapshot_id &&
@@ -248,11 +357,12 @@ export function createNativeTarget(options = {}) {
         if (tool === 'click') requireThat(mode === 'background' && (args.button ?? 'left') === 'left' &&
           (args.count ?? 1) === 1 && Array.isArray(matches[0].actions) &&
           matches[0].actions.includes('AXPress'), 'AX click requires advertised AXPress.');
-      } else if (tool === 'click') {
-        const image = observation.local.screenshot;
+      } else if (pixelClick) {
         requireThat(pixels && current.settled && geometry(image) !== null && Number.isFinite(args.x) &&
           Number.isFinite(args.y) && args.x >= 0 && args.y >= 0 && args.x < image.width && args.y < image.height,
         'Pixels require a current settled capture and in-bounds coordinates.');
+        requireThat(typeof image.capture_id === 'string' &&
+          (!own(args, 'capture_id') || args.capture_id === image.capture_id), 'Pixels require the native capture_id.');
       } else requireThat(tool !== 'set_value', 'set_value requires a current AX identity.');
       if (tool === 'click') requireThat((!own(args, 'button') || ['left', 'right', 'middle'].includes(args.button)) &&
         (!own(args, 'count') || positiveInteger(args.count)), 'Invalid click arguments.');
@@ -261,11 +371,17 @@ export function createNativeTarget(options = {}) {
       if (tool === 'press_key') requireThat(typeof args.key === 'string' && args.key.length > 0, 'press_key requires a key.');
       const request = { ...args, pid, window_id: windowId };
       if (tool !== 'set_value') request.delivery_mode = mode;
+      if (pixelClick) {
+        request.capture_id = image.capture_id;
+        await guardPixel(image, args.x, args.y, mode);
+      }
       const receipt = await driver.call(tool, request);
+      requireThat(!pixelClick || receipt.route !== 'accessibility', 'Pixel click was routed to accessibility.',
+        true, 'pixel_routed_to_accessibility');
       const eventRoute = mode === 'foreground' ? 'global_input' : 'synthetic_events';
       const axOnly = tool === 'set_value' || (tool === 'click' && hasElement);
       const routeAccepted = axOnly ? receipt.route === 'accessibility'
-        : receipt.route === eventRoute || (tool !== 'press_key' && receipt.route === 'accessibility');
+        : receipt.route === eventRoute || (!pixelClick && tool !== 'press_key' && receipt.route === 'accessibility');
       const evidence = receipt.evidence;
       const validEvidence = Array.isArray(evidence) && evidence.length > 0 && evidence.every(item =>
         item && Object.keys(item).length === 1 && ['value_readback', 'window_change'].includes(item.kind));
@@ -277,17 +393,137 @@ export function createNativeTarget(options = {}) {
         for (const character of request.text) count += 1;
         requireThat(receipt.delivery.delivered_count === count, 'Native typing was partial.', true);
       }
-      return receipt;
+      if (pixelClick) {
+        const { windows } = await guardRead(() => driver.listWindows(pid), true, 'guard_unavailable_after_dispatch');
+        const matches = windows.filter(window => window.window_id === windowId);
+        requireThat(matches.length === 1 && sameBounds(matches[0].bounds, image.window_bounds),
+          'Target window moved during dispatch.', true, 'target_moved_during_dispatch');
+      }
+      const projected = { ...receipt };
+      delete projected.summary;
+      return freeze(projected);
     } finally { invalidate(); }
+  }
+  // Pre-dispatch pixel guard: exact bounds; foreground adds the main display and z-order at the screen point.
+  async function guardPixel(image, x, y, mode) {
+    const bounds = image.window_bounds;
+    const { windows } = await guardRead(() => driver.listWindows(pid));
+    const matches = windows.filter(window => window.window_id === windowId);
+    requireThat(matches.length === 1, 'Target window is missing.', false, 'target_missing');
+    const now = matches[0].bounds;
+    requireThat(sameBounds(now, bounds), 'Target window moved.', false, 'target_moved');
+    if (mode !== 'foreground') return;
+    // Capture pixels per point come from width/bounds, never screenshot scale. The capture's and the current
+    // bounds may differ within tolerance, so both derived points must pass.
+    const points = [bounds, now].map(frame =>
+      [frame.x + x * frame.width / image.width, frame.y + y * frame.height / image.height]);
+    const display = await guardRead(() => driver.screenSize());
+    // Global input clamps off-display points onto whatever is there; only the main display is addressable.
+    requireThat(points.every(([px, py]) => px >= 0 && px < display.width && py >= 0 && py < display.height),
+      'Target point is off the main display.', false, 'target_offscreen');
+    const screen = await guardRead(() => driver.listOnScreenWindows());
+    const targets = screen.filter(window => window.window_id === windowId);
+    requireThat(targets.length === 1 && targets[0].pid === pid, 'Target window is missing.', false, 'target_missing');
+    const z = targets[0].z_index;
+    // Only the Driver's own click-through overlay is exempt: driver_owned literally true AND covering the whole
+    // main display. Driver-owned cards (approvals), however large, and unknown ownership still occlude.
+    const mainDisplay = { x: 0, y: 0, width: display.width, height: display.height };
+    const overlay = window => window.driver_owned === true && containsBounds(window.bounds, mainDisplay);
+    requireThat(screen.every(window => window.window_id === windowId || overlay(window) ||
+      points.every(([px, py]) => !containsPoint(window.bounds, px, py)) ||
+      (Number.isInteger(window.z_index) && Number.isInteger(z) && window.z_index < z)),
+    'Target point is occluded.', false, 'target_occluded');
+  }
+  async function verify(options) {
+    invalidate();
+    requireThat(active, 'Session is not active.');
+    record(options);
+    requireThat(Object.keys(options).every(key => VERIFY_FIELDS.has(key)), 'Unknown verify option.');
+    const { expect, timeoutMs = 5000, stableSamples = 2 } = options;
+    // Native verify_state limits: 1-8 predicates, timeout_ms 0-10000, stable_samples 1-5.
+    requireThat(Array.isArray(expect) && !isProxy(expect) && expect.length > 0 && expect.length <= 8 &&
+      Number.isSafeInteger(timeoutMs) && timeoutMs >= 0 && timeoutMs <= 10000 &&
+      positiveInteger(stableSamples) && stableSamples <= 5, 'Invalid verify options.');
+    const requested = expect.length;
+    const reply = await driver.call('verify_state', {
+      pid, window_id: windowId, expect, timeout_ms: timeoutMs, stable_samples: stableSamples,
+    });
+    requireThat(Array.isArray(reply.predicates), 'Malformed verification receipt.');
+    const seen = new Set();
+    const predicates = reply.predicates.map(item => {
+      requireThat(item !== null && typeof item === 'object' && Number.isSafeInteger(item.index) && item.index >= 0 &&
+        item.index < requested && !seen.has(item.index), 'Malformed verification receipt.');
+      seen.add(item.index);
+      const predicate = { index: item.index, status: VERIFY_STATUSES.has(item.status) ? item.status : 'unknown' };
+      if (typeof item.unknown_reason === 'string' && REASON_CODE.test(item.unknown_reason)) {
+        predicate.unknownReason = item.unknown_reason;
+      }
+      return predicate;
+    });
+    // Satisfied only as the literal native status with every requested predicate satisfied.
+    const satisfied = reply.status === 'satisfied' && seen.size === requested &&
+      predicates.every(predicate => predicate.status === 'satisfied');
+    return freeze({
+      status: satisfied ? 'satisfied' : reply.status === 'unsatisfied' ? 'unsatisfied' : 'unknown',
+      stable: typeof reply.stable === 'boolean' ? reply.stable : null,
+      samples: Number.isSafeInteger(reply.samples) && reply.samples >= 0 ? reply.samples : null,
+      elapsedMs: Number.isFinite(reply.elapsed_ms) && reply.elapsed_ms >= 0 ? reply.elapsed_ms : null,
+      predicates,
+    });
+  }
+  async function regions(observation, options) {
+    requireThat(active && issued.has(observation), 'Observation is not owned by this target.');
+    const image = observation.local.screenshot;
+    requireThat(image !== undefined, 'Observation has no owned capture.');
+    record(options);
+    requireThat(await ownedFile(() => realpath(image.file_path)) === image.file_path, 'Capture is not the owned file.');
+    const bytes = await ownedFile(() => readFile(image.file_path));
+    requireThat(bytes.length === image.byte_length &&
+      createHash('sha256').update(bytes).digest('hex') === image.sha256, 'Capture changed after observation.');
+    // Decode the hashed bytes themselves; the file is never read again.
+    const decoded = decodePng(bytes);
+    requireThat(decoded.width === image.width && decoded.height === image.height, 'Capture dimensions do not match.');
+    return freeze({ ...findRegions(decoded, options), capture_id: image.capture_id,
+      width: decoded.width, height: decoded.height });
   }
   return Object.freeze({
     session: driver.session, pid, windowId,
-    start() { return operate(async () => { invalidate(); const receipt = await driver.start(); active = true; return receipt; }); },
+    start() { return operate(async () => {
+      invalidate();
+      if (lifecycle === 'new') lifecycle = 'attempted';
+      const receipt = await driver.start();
+      await driver.recordOwnership({ target: { pid, windowId } });
+      active = true;
+      return receipt;
+    }); },
+    resume() { return operate(async () => {
+      invalidate();
+      const first = lifecycle === 'new';
+      if (first) lifecycle = 'attempted';
+      let receipt;
+      // get_session is read-only: a refused first resume adopted nothing, so end() has no session to close.
+      try { receipt = await driver.resume(); }
+      catch (error) { if (first) lifecycle = 'unadopted'; throw error; }
+      if (journalPath !== undefined) {
+        let entry;
+        try { entry = await readEntry(journalPath, driver.session); }
+        catch { requireThat(false, 'Journal entry is unreadable.'); }
+        // Adopt only the shared owned-capture rule's canonical spelling, never a symlink alias.
+        // The adopted directory is already journaled; end() removes it with later captures.
+        const candidate = entry?.captureDirectory;
+        if (candidate !== undefined && await ownedCaptureDirectory(candidate) === candidate) {
+          directory = recorded = candidate;
+        }
+      }
+      await driver.recordOwnership({ target: { pid, windowId } });
+      active = true;
+      return receipt;
+    }); },
     end() { return operate(async () => {
       invalidate(); active = false;
       requireThat(endReceipt === null || directory !== null, 'Session is already ended.');
       let receipt = endReceipt, failure;
-      try { if (receipt === null) { receipt = await driver.end(); endReceipt = receipt; } }
+      try { if (receipt === null && lifecycle !== 'unadopted') { receipt = await driver.end(); endReceipt = receipt; } }
       catch (error) { failure = error; }
       try { if (directory) { await ownedFile(() => rm(directory, { recursive: true, force: true })); directory = null; } }
       catch (error) { failure ??= error; }
@@ -301,6 +537,8 @@ export function createNativeTarget(options = {}) {
     }); },
     observe(options = {}) { return operate(() => capture(options)); },
     settle(options) { return operate(() => settle(options)); },
+    verify(options) { return operate(() => verify(options)); },
+    regions(observation, options) { return operate(() => regions(observation, options)); },
     execute(candidate, observation) { return operate(() => execute(candidate, observation)); },
   });
 }

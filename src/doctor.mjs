@@ -2,12 +2,14 @@ import { execFile } from 'node:child_process';
 import { constants } from 'node:fs';
 import { access, stat } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
+import { journalDirectory, readJournal } from './journal.mjs';
 
 const MINIMUM_BUN = '1.3.14';
 const MINIMUM_OMP = '18.2.7';
+const TESTED_DRIVER = '0.30.2-nightly.20260927.36294544935';
 const TIMEOUT_MS = 5_000;
 const MAX_BUFFER = 64 * 1024;
-const RESOURCE_NAMES = ['loop', 'driver', 'demo', 'probe', 'skill'];
+const RESOURCE_NAMES = ['loop', 'driver', 'native', 'pixels', 'sessions', 'demo', 'canvasDemo', 'probe', 'skill'];
 const DIRECT_CAPTURE_STATES = new Set([
   'ready', 'unavailable', 'timed_out', 'probe_failed', 'blocked_by_screen_recording', 'not_checked',
 ]);
@@ -122,6 +124,50 @@ function permissionStatus(result) {
   };
 }
 
+// Parses the JSON object that starts `text` after optional whitespace; later text is ignored.
+function leadingObject(text) {
+  const start = text.search(/\S/);
+  if (start < 0 || text[start] !== '{') return null;
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let index = start; index < text.length; index++) {
+    const char = text[index];
+    if (escaped) escaped = false;
+    else if (quoted) {
+      if (char === '\\') escaped = true;
+      else if (char === '"') quoted = false;
+    } else if (char === '"') quoted = true;
+    else if (char === '{') depth++;
+    else if (char === '}' && --depth === 0) {
+      try { return JSON.parse(text.slice(start, index + 1)); } catch { return null; }
+    }
+  }
+  return null;
+}
+
+function clickInputSchema(result) {
+  if (result.state !== 'ok') return null;
+  try {
+    const payload = JSON.parse(result.stdout);
+    if (isObject(payload)) {
+      return isObject(payload.input_schema) ? payload.input_schema
+        : isObject(payload.inputSchema) ? payload.inputSchema : null;
+    }
+  } catch { /* The inspected CLI prints prose, then an `input_schema:` line followed by the JSON schema. */ }
+  const marker = /^input_schema:[ \t]*\r?$/m.exec(result.stdout);
+  const schema = marker ? leadingObject(result.stdout.slice(marker.index + marker[0].length)) : null;
+  return isObject(schema) ? schema : null;
+}
+
+function captureBoundPixels(result) {
+  // Only a declared input property counts. Description prose that mentions capture_id does not.
+  const properties = clickInputSchema(result)?.properties;
+  if (!isObject(properties)) return null;
+  // A boolean `true` subschema also declares the property; `false` forbids it.
+  return Object.hasOwn(properties, 'capture_id') && (isObject(properties.capture_id) || properties.capture_id === true);
+}
+
 async function resourceStatus(paths) {
   if (paths === undefined) return { state: 'not_checked' };
   const files = {};
@@ -145,9 +191,28 @@ async function resourceStatus(paths) {
 }
 
 /**
+ * Counts valid on-disk session journal entries through src/journal.mjs, which never creates the
+ * directory, follows symlinks, or writes. A missing, symlinked, or foreign directory has none.
+ */
+async function journalStatus() {
+  let directory;
+  try {
+    directory = journalDirectory();
+  } catch {
+    // A non-empty OMP_CUA_JEV_STATE_DIR only throws when invalid; otherwise the home fallback failed.
+    return { state: process.env.OMP_CUA_JEV_STATE_DIR ? 'invalid_override' : 'unreadable', entries: null };
+  }
+  try {
+    return { state: 'checked', entries: (await readJournal(directory)).length };
+  } catch {
+    return { state: 'unreadable', entries: null };
+  }
+}
+
+/**
  * Read-only prerequisite report, usable without OMP. Host metadata is supplied by
  * the extension, not inferred from another omp process or a second model client.
- * No sessions, capture, prompts, configuration changes, or judge calls occur.
+ * No sessions, capture, prompts, configuration changes, journal writes, or judge calls occur.
  */
 export async function doctor({ host, paths, binary = 'cua-driver' } = {}) {
   const blocking = [];
@@ -182,23 +247,32 @@ export async function doctor({ host, paths, binary = 'cua-driver' } = {}) {
     issue(blocking, 'PACKAGE_RESOURCES_UNAVAILABLE', 'One or more installed helper or skill files are missing or unreadable.',
       'Inspect jev_resources with action paths and relink the complete package directory using omp plugin link /path/to/omp-cua-jev.');
   }
+  const journal = await journalStatus();
 
   const validBinary = typeof binary === 'string' && binary.trim().length > 0 && !binary.includes('\0');
   const skipped = { state: 'invalid_binary', exitCode: null, stdout: '', stderr: '' };
-  const [versionResult, statusResult, permissionsResult] = validBinary
+  const [versionResult, statusResult, permissionsResult, describeResult] = validBinary
     ? await Promise.all([
       run(binary, ['--version']),
       run(binary, ['status']),
       run(binary, ['permissions', 'status', '--json']),
-    ]) : [skipped, skipped, skipped];
+      run(binary, ['describe', 'click']),
+    ]) : [skipped, skipped, skipped, skipped];
   const driverVersion = versionResult.state === 'ok' && versionResult.stdout.startsWith('cua-driver ')
     ? version(versionResult.stdout.slice('cua-driver '.length)) : null;
   const daemon = daemonStatus(statusResult);
   const permissions = permissionStatus(permissionsResult);
+  const captureBound = captureBoundPixels(describeResult);
   if (versionResult.state !== 'ok') issue(blocking, 'CUA_CLI_UNAVAILABLE',
     'The Cua Driver version command did not complete successfully.',
     'Install or repair Cua Driver using the official setup instructions linked in README, then rerun doctor.');
   else if (!driverVersion) issue(warnings, 'CUA_VERSION_UNKNOWN', 'The Cua Driver version output was not recognized.');
+  else if (driverVersion !== TESTED_DRIVER) issue(warnings, 'CUA_VERSION_UNTESTED',
+    'The installed Cua Driver version differs from native.testedDriver; native helper behavior may differ.');
+  if (versionResult.state === 'ok' && captureBound === false) issue(warnings, 'CAPTURE_BOUND_PIXELS_UNAVAILABLE',
+    'The click schema from cua-driver describe click does not declare capture_id; capture-bound pixel clicks are unavailable.');
+  else if (versionResult.state === 'ok' && captureBound === null) issue(warnings, 'CAPTURE_BOUND_PIXELS_UNKNOWN',
+    'The click schema from cua-driver describe click was not recognized; capture-bound pixel support is unknown.');
   if (daemon.state !== 'listening') issue(blocking, 'CUA_DAEMON_UNAVAILABLE',
     'A listening Cua Driver daemon was not established by status.',
     'Have the operator complete standard Cua onboarding. On macOS use the installed CuaDriver app through LaunchServices; preserve any existing launch flags during authorized recovery.');
@@ -220,7 +294,7 @@ export async function doctor({ host, paths, binary = 'cua-driver' } = {}) {
     nextSteps.add(host === undefined
       ? 'Run /jev doctor in the intended stock OMP session to check its version and advertised JavaScript eval.'
       : 'Run /jev probe to make a separate synthetic call through the configured host judge; inspect its actual result.');
-    nextSteps.add('For separately authorized native proof, use /jev demo in OMP or bun src/demo.mjs for the deterministic CLI demo. Check fixture completion and owned cleanup independently.');
+    nextSteps.add('For separately authorized native proof, use /jev demo or /jev canvas in OMP, or bun src/demo.mjs / bun src/canvas-demo.mjs for the deterministic CLI demos. The canvas demo briefly foregrounds its own isolated browser window. Check fixture completion and owned cleanup independently.');
   }
 
   return {
@@ -236,15 +310,20 @@ export async function doctor({ host, paths, binary = 'cua-driver' } = {}) {
     resources,
     native: {
       version: driverVersion,
+      testedDriver: TESTED_DRIVER,
+      testedDriverMatch: driverVersion ? driverVersion === TESTED_DRIVER : null,
       commandTimeoutMs: TIMEOUT_MS,
       commands: {
         version: commandResult(versionResult),
         status: commandResult(statusResult),
         permissions: commandResult(permissionsResult),
+        describe: commandResult(describeResult),
       },
       daemon,
       permissions,
     },
+    capabilities: { captureBoundPixels: captureBound },
+    journal,
     evidence: {
       nativeTransport: permissions.state === 'reported' ? 'permission_status_query_only' : 'unverified',
       nativeSession: 'not_tested',
@@ -261,6 +340,7 @@ export async function doctor({ host, paths, binary = 'cua-driver' } = {}) {
       'Permission status may include historical grant evidence. Doctor neither captures the screen nor revalidates that evidence.',
       'OMP host version and eval checks use supplied metadata; judge credentials and execution require /jev probe inside stock eval.',
       'Browser delivery, application completion, and owned-resource cleanup require a separately authorized native fixture run.',
+      'The capture-bound pixel capability reflects the click schema declared by cua-driver describe click, not a delivered click. Journal entries are valid on-disk records; Doctor does not ask the daemon whether those sessions are live.',
       'Publishing remains blocked until an actual clean-machine standard-mode run. A fresh HOME on a configured machine is insufficient.',
     ],
   };

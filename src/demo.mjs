@@ -304,8 +304,9 @@ export async function runDemo({ judge = unavailableJudge, onProgress, binary = '
       accepted: false, receipt: null, verification: null };
     native.actions.push(action);
     await at(tool, async () => {
-      const receipt = await driver.call(tool, args);
-      requireThat(positiveReply(receipt) && receipt.effect === 'unverifiable'
+      // Driver 0.30 adds a free-text root summary; it is native prose, not receipt evidence.
+      const { summary, ...receipt } = await driver.call(tool, args);
+      requireThat((summary === undefined || typeof summary === 'string') && positiveReply(receipt) && receipt.effect === 'unverifiable'
         && record(receipt.delivery) && receipt.delivery.mode === 'background', 'ACTION_RECEIPT_MISMATCH', true);
       if (fill) {
         requireThat(exactObject(receipt, { effect: 'unverifiable', route: 'trusted_input', delivery: receipt.delivery })
