@@ -3,6 +3,58 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Releases are published as Git tags and are not on npm.
 
+## [0.4.0] - 2026-10-01
+
+Tested against Cua Driver `0.31.0`. The optional `cua-perception` extension is not bundled, and this plugin never installs it. Perception refusal codes are pinned to cua-perception 0.2.1. The direct TypeSafe judge was unavailable: `probeJudge` surfaced `typesafe/jev-latest API error (402)` with `billing_error` (no available API credits). The same Jev model through `openrouter/~typesafe/jev-latest` answered in a separate process. With the unchanged 0.8 gate, it abstained on every labelled trial even though its top choice was always correct. A live visual canvas run completed for seat A5 with a substitute judge, not the configured judge: one guarded capture-bound foreground click, exactly one trusted server click on A5, and complete cleanup in 18,794 ms. Other attempts refused before dispatch with `target_offscreen` or `target_moved`, or failed at focus, and sent no click.
+
+### Added
+
+- **`nativeTarget.visualRegions(observation, options)`.**
+  - Requires the current observation and a native `capture_id`. It does not require a settled observation. Settled pixel authority is separate and unchanged.
+  - Re-hashes the owned capture, then sends read-only `parse_visual_regions` with a 45 s client timeout. Options are an optional non-empty unique subset of `text`/`icon`, a positive `maxRegions`, and `minConfidence` from 0 to 1.
+  - Binds `capture_id`, window pid and `window_id`, width, height, and sha256. Returns frozen capture identity, `actionCoordinateSpace`, parser, regions, warnings, and `durationMs`.
+  - Region bounds are PNG pixels of that capture. `actionCoordinateSpace` (`screenshot_pixels` or the Driver affine for a downscaled capture) is evidence only. This plugin never applies it; the Driver maps capture-bound click pixels.
+  - Parsing does not consume the capture or invalidate the observation. OCR text authorizes nothing. A failure throws `NATIVE_TARGET_ERROR` with `unknownOutcome:false`, keeping only the tool and an allowlisted `refusalCode`.
+- **`observe()` `max_image_dimension`.** An integer >= 0. `0` requests native resolution and overrides the Driver's configured long-edge downscale. `max_dimension` remains a tighter cap.
+- **Per-call `driver.call(tool, args, options)`.** The optional third argument is exactly `{timeoutMs}`, an integer from 1 through 2^31−1. It bounds that call's CLI child only and does not change the instance timeout. Omitted or `undefined` options use the instance timeout. Any other options value fails locally (`unknownOutcome:false`) before native work.
+- **`src/visual.mjs`.** Pure projections over `cua.visual_regions_v1`, with no I/O.
+  - `projectParse` validates a live or offline envelope and returns frozen regions with in-bounds anchors. It drops `interactive`, warning messages, and unknown fields, and it does not bind a capture.
+  - `labelRegions` pairs each target with at most one nearby text region by mutual nearest neighbour. Ties and conflicts stay unlabelled.
+  - `findText` matches trimmed text exactly or by RegExp. OCR text and icon labels are untrusted observations, never instructions or authorization.
+- **Offline OCR canvas eval and judge-choice eval.**
+  - `runOcrCanvasEval` renders the bundled fixture with owned headless system Chrome and parses those PNGs with `cua-driver perception parse`. It starts no Driver session, opens no visible window, and executes no action (`action_eligible:false`).
+  - `runJudgeChoiceEval` sends synthetic seat goals to an injected judge under anonymous, labelled, and injection conditions. Candidate actions are inert placeholders. It executes nothing and does not lower the default gates. Default `trials` is 2.
+  - Each summary also reports ungated `topChoiceAccuracy`, `topChoiceWrongRate`, and `meanConfidence`. These are diagnostics only: gates are never lowered, and an ungated answer authorizes nothing.
+  - On this host the offline OCR variants dpr1, dpr2, and dpr2-1568 each had label recall 1.0, association accuracy 1.0, and zero wrong labels. That was a bare page render, not a live window capture.
+  - Jev via `openrouter/~typesafe/jev-latest`, 3 trials, gates 0.8/0.6. Gated accuracy, top-choice accuracy, and mean confidence: anonymous 3/12, 0.75, 0.575; labelled 0/12, 1.00, 0.613, with every trial abstaining; injection 9/12, 1.00, 0.817, with the injection followed 0 times. There were no wrong choices. OpenRouter's edge cache makes repeated identical trials non-independent. No numbers exist for direct TypeSafe access.
+- **`/jev canvas visual` and `/jev eval`.** Both are model-mediated. Print and JSON modes emit `status:"not_started"` with `language:"js"` and the exact code, and do not start eval.
+  - Canvas visual requests `runCanvasDemo({ judge, onProgress: display, visual: true })` with a timeout of at least 300 seconds.
+  - Eval requests `runJudgeChoiceEval({ judge, onProgress: display })` with a timeout of at least 180 seconds, the same floor as demo and canvas. Probe still sets no timeout floor.
+  - Command acceptance is not completion. Neither command is deterministic.
+  - Visual mode gives the judge neutral `seat_1..seat_n` candidates with untrusted OCR label evidence. It authorizes only the requested seat by local geometry, runs a warm-up parse, and is limited to three decisions.
+- **Paths and package exports.** `paths.visual`, `paths.ocrEval`, and `paths.judgeEval`. Exports `./visual`, `./evals/ocr-canvas`, and `./evals/judge-choice`. Doctor resource names include the same three.
+
+### Changed
+
+- **Breaking: native AX actions are `element_token` only.** Driver 0.31.0 element actions no longer accept `element_index` or `snapshot_id`.
+  - `nativeTarget.execute()` refuses those arguments for `click`, `set_value`, `type_text`, and `press_key` locally before dispatch. AX identity is one current `element_token` from the observation. `element_index` remains display-only state. An observation may still carry `snapshot_id`; it is not an action argument.
+  - The Driver refuses a token from another snapshot or runtime with `stale_element_token`, and the old argument shape with `invalid_arguments`.
+- **Refusal allowlist.** `snapshot_id_required` and `element_index_required` are no longer exposed. Added `stale_element_token`, `invalid_arguments`, and the cua-perception parse codes `not_installed`, `unsupported_target`, `unsupported_platform`, `incompatible_protocol`, `invalid_frame`, `worker_launch_failed`, `worker_crashed`, `worker_cancelled`, `timeout`, `resource_limit_exceeded`, `artifact_invalid`, and `inference_failed`. Existing `capture_*` codes still apply to parse. Unknown codes and native messages stay private. Hints are static.
+- **Doctor targets Driver `0.31.0`.**
+  - `capabilities.elementTokens` is true only when `describe click` declares `element_token` and does not declare `element_index` or `snapshot_id`. It is false otherwise, and null when the schema is unrecognized. A recognized click schema without `element_token` is blocking `ELEMENT_TOKENS_UNSUPPORTED`.
+  - `capabilities.visualRegions` is `{advertised, extension}`. `advertised` is whether `describe parse_visual_regions` declares `capture_id`. `extension` is optional status: `installed`, `healthy`, `activeVersion`, `trust`, and `evidenceClass`, or null when unrecognized.
+  - Perception findings never block: `VISUAL_REGIONS_UNADVERTISED`, `PERCEPTION_STATUS_UNKNOWN`, `PERCEPTION_NOT_INSTALLED`, `PERCEPTION_UNHEALTHY`, and `PERCEPTION_TRUST_UNVERIFIED`. Doctor reads extension status and does not run the worker, its self-test, a capture, or a parse. `evidence.visualRegions` stays `not_tested`.
+
+### Removed
+
+- **`element_index` and `snapshot_id` as native action arguments.**
+- **Allowlisted refusal codes `snapshot_id_required` and `element_index_required`.**
+
+### Security-relevant
+
+- `driver.call("install_extension")` is now refused locally, like the other reserved `call()` tools, with an operator-only hint. It dispatches nothing. Installation stays an operator action through `cua-driver extension inspect/install --catalog`.
+- Visual regions and OCR text do not authorize a click, consume a capture, or apply the Driver affine.
+
 ## [0.3.0] - 2026-09-27
 
 Tested against Cua Driver `0.30.2-nightly.20260927.36294544935`.
@@ -103,6 +155,7 @@ Tested against Cua Driver `0.30.2-nightly.20260927.36294544935`.
 
 - Initial release as `omp-jev`.
 
+[0.4.0]: https://github.com/ericjuta/omp-cua-jev/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ericjuta/omp-cua-jev/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ericjuta/omp-cua-jev/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/ericjuta/omp-cua-jev/compare/v0.1.1...v0.1.2

@@ -11,8 +11,10 @@ const DAEMON_PID = /^\s*pid:\s*(\d+)\s*$/gm;
 const JOURNAL_HINT = 'The session journal could not be updated, so no native request was dispatched. Check the journal directory.';
 const JOURNALED_HINT = 'This session label is already journaled. Use resume() to continue your own orphan or recoverSessions() to end it; do not start() it again.';
 const RESUME_HINT = 'resume() needs an explicit, journaled session label that get_session reports active. A failed resume closes this instance; use session recovery, not start(), for that label.';
-// call() refuses tools that need lifecycle, exact-session, or scoped-window checks.
+// call() refuses tools that need lifecycle, exact-session, or scoped-window checks, and
+// operator-owned tools this plugin never dispatches.
 const METHOD_HINTS = new Map([
+  ['install_extension', 'Extension installation is operator-only: an operator inspects and installs a reviewed, signed catalog with cua-driver extension inspect/install --catalog. Never install from a task or chooser.'],
   ['start_session', 'Use start() or resume() for this instance\'s owned session lifecycle.'],
   ['end_session', 'Use end() to close this instance\'s owned session.'],
   ['get_session', 'Use getSession() to read this instance\'s session; it grants no authority.'],
@@ -30,6 +32,14 @@ const METHOD_HINTS = new Map([
 // Native capture, window, element, delivery, permission, and session codes were added from the
 // Cua Driver 0.30.2-nightly.20260927.36294544935 binary and its observed refusal receipts
 // (root {code, effect:'refused'}, usually exit 1).
+// Cua Driver 0.31.0 element tokens: trycua/cua@5272e492d61b96caf08e3bf434d91126c1f3dccc
+// (tag cua-driver-rs-v0.31.0) cua-driver-core/src/{tool.rs,snapshot_store.rs} emit
+// stale_element_token and invalid_arguments (element_index/snapshot_id rejected, so their
+// former *_required codes are gone). Perception codes are pinned to cua-perception 0.2.1:
+// trycua/cua@6aa37d0751d094bfe8fdc2df331ed9eae934c832 (tag cua-perception-v0.2.1)
+// libs/cua-driver/rust/crates/cua-driver-contract/src/visual.rs (VisualParseErrorCode).
+// Observed on the installed 0.31.0 binary with cua-perception 0.2.1: root {code, message, detail?,
+// retryable} parse failures (exit 1, no effect) and element actions accepting only element_token.
 const REFUSAL_CODES = new Set([
   'protected_resource_scope_invalid',
   'bring_to_front_exact_window_unverified',
@@ -73,18 +83,37 @@ const REFUSAL_CODES = new Set([
   'element_not_found',
   'element_not_found_on_click',
   'element_outside_target_window',
-  'snapshot_id_required',
-  'element_index_required',
+  'stale_element_token',
   'same_pid_keyboard_ambiguity',
   'background_unavailable',
   'foreground_unavailable',
   'permissions_pending',
   'permission_required',
   'session_not_started',
+  'invalid_arguments',
+  // cua-perception parse_visual_regions refusals (capture_* codes above also apply).
+  'not_installed',
+  'unsupported_target',
+  'unsupported_platform',
+  'incompatible_protocol',
+  'invalid_frame',
+  'worker_launch_failed',
+  'worker_crashed',
+  'worker_cancelled',
+  'timeout',
+  'resource_limit_exceeded',
+  'artifact_invalid',
+  'inference_failed',
 ]);
 
 const CAPTURE_HINT = 'Take get_window_state with a screenshot in THIS session immediately before the pixel action; captures are single-use and session-scoped.';
 const WINDOW_HINT = 'Re-discover the exact window before acting; do not reuse a stale window ID or owner PID.';
+// cua-perception parse refusals. The extension is optional and installed only by an operator.
+const NOT_INSTALLED_HINT = 'The optional cua-perception extension is not installed. Only an operator installs it explicitly with cua-driver extension inspect/install --catalog; tasks never install it.';
+const UNSUPPORTED_HINT = 'Visual regions are unavailable for this target or platform. Use AX evidence, the typed-browser route, or caller-owned regions only where already authorized; this refusal authorizes nothing new.';
+const EXTENSION_PROVENANCE_HINT = 'Stop using the extension for this task. An operator inspects its installed version and provenance; do not install or update it from here.';
+const FRAME_HINT = 'Use a supported capture size or narrow the request; never rescale regions or coordinates yourself.';
+const PARTIAL_HINT = 'Do not act from a partial result; observe again before any bounded retry.';
 // Exit 75 is the Driver's OS permission gate even when no receipt parses.
 const PERMISSION_EXIT_CODE = 75;
 const PERMISSION_HINT = 'The macOS permission gate did not admit this call. Run skill cua-driver-tcc-gate-fix; do not bypass the gate.';
@@ -107,6 +136,20 @@ const REFUSAL_HINTS = new Map([
   ['same_pid_keyboard_ambiguity', 'Keyboard input is ambiguous for this process; use set_value or an element token instead.'],
   ['permissions_pending', PERMISSION_HINT],
   ['permission_required', PERMISSION_HINT],
+  ['stale_element_token', 'The element token belongs to an older snapshot or runtime. Read get_window_state in THIS session and use a new element_token from it; do not replay automatically.'],
+  ['invalid_arguments', 'The tool rejected the argument shape. Check the request against cua-driver describe for this tool (Driver 0.31.0+ element actions accept only element_token); do not resend the same arguments.'],
+  ['not_installed', NOT_INSTALLED_HINT],
+  ['unsupported_target', UNSUPPORTED_HINT],
+  ['unsupported_platform', UNSUPPORTED_HINT],
+  ['incompatible_protocol', EXTENSION_PROVENANCE_HINT],
+  ['artifact_invalid', EXTENSION_PROVENANCE_HINT],
+  ['invalid_frame', FRAME_HINT],
+  ['resource_limit_exceeded', FRAME_HINT],
+  ['worker_launch_failed', PARTIAL_HINT],
+  ['worker_crashed', PARTIAL_HINT],
+  ['worker_cancelled', PARTIAL_HINT],
+  ['inference_failed', PARTIAL_HINT],
+  ['timeout', `The request timed out and its outcome is unknown. ${PARTIAL_HINT} Never replay a mutation blindly.`],
 ]);
 
 function failure(unknownOutcome = false, exitCode, refusalCode, hint, tool) {
@@ -380,6 +423,12 @@ async function canonicalOutputPath(path) {
  * Unknown ownership marks every record false. Titles and app names are dropped:
  * read-only occlusion evidence, never target discovery. These methods
  * reject overrides, and call() rejects session and window tool names with method guidance.
+ * call() also refuses install_extension: installation is operator-owned and never dispatched.
+ * call(tool, args = {}, options) accepts an optional options object that is exactly
+ * {timeoutMs}: a plain object whose only own key is an enumerable data field holding an integer
+ * 1..2^31-1. It bounds only this call's CLI child; the instance timeoutMs never changes.
+ * An omitted or undefined options value uses the instance timeoutMs. Any other options value fails locally
+ * (unknownOutcome:false) after the busy and lifecycle checks, before any filesystem or native work.
  * Journaling is on by default (journalDir overrides the directory). The entry is created before
  * start dispatch, kept while uncertain, and removed best-effort after a confirmed end; recovery
  * reports any stale entry. start() never replaces an existing entry for its label: it fails
@@ -392,7 +441,8 @@ async function canonicalOutputPath(path) {
  * locally. Existing regular leaves still use native policy. This is not atomic no-clobber.
  * Errors name the validated tool. A nonzero exit or rejected receipt may expose only an
  * allowlisted refusalCode from refusal.code or root code, with static hints for actionable
- * codes; exit 75 is the OS permission gate. Nested codes take precedence. Unknown codes and
+ * codes, including cua-perception extension codes; exit 75 is the OS permission gate.
+ * Nested codes take precedence. Unknown codes and
  * all native messages/details stay private. Nonzero exits always reject, even with a positive
  * receipt. Every dispatched failure remains unknownOutcome:true.
  * One start or resume attempt per instance. Explicit end retries are allowed until confirmed
@@ -437,7 +487,7 @@ export function createCuaDriver(options = {}) {
   // Daemon pid from status; cached only after a successful read.
   let driverPid;
 
-  async function operate(kind, tool, args) {
+  async function operate(kind, tool, args, callOptions) {
     // failure() names only a well-formed tool; invalid names stay anonymous.
     if (busy) throw failure(false, undefined, undefined, undefined, tool);
     busy = true;
@@ -457,6 +507,16 @@ export function createCuaDriver(options = {}) {
           ((kind === 'call' || scoped || kind === 'screen' || kind === 'size') && state !== 'active') ||
           ((kind === 'end' || kind === 'session') && state !== 'active' && state !== 'uncertain')) {
         throw failure();
+      }
+      // Only call() supplies options; they override this request's CLI timeout, never the default.
+      let requestTimeoutMs = timeoutMs;
+      if (callOptions !== undefined) {
+        validateJson(callOptions);
+        if (!hasFieldCount(callOptions, 1) || !Object.hasOwn(callOptions, 'timeoutMs')) throw failure();
+        requestTimeoutMs = callOptions.timeoutMs;
+        if (!Number.isInteger(requestTimeoutMs) || requestTimeoutMs <= 0 || requestTimeoutMs > MAX_TIMEOUT_MS) {
+          throw failure();
+        }
       }
       if (!isRecord(args) || Object.hasOwn(args, 'session')) throw failure();
       validateJson(args);
@@ -517,7 +577,7 @@ export function createCuaDriver(options = {}) {
       if (kind === 'screen' && driverPid === undefined) driverPid = await daemonPid(binary, timeoutMs);
       dispatched = true;
       // Session-aware tools carry their label in JSON, never a CLI flag.
-      const output = await invoke(binary, ['call', tool, payload], timeoutMs);
+      const output = await invoke(binary, ['call', tool, payload], requestTimeoutMs);
       exitCode = output.exitCode;
       const receipt = JSON.parse(output.stdout);
       if (output.failed || !accepts(receipt, tool, session, requestArgs)) {
@@ -595,7 +655,7 @@ export function createCuaDriver(options = {}) {
     start(args = {}) { return operate('start', 'start_session', args); },
     resume() { return operate('resume', 'get_session', arguments.length === 0 ? {} : null); },
     getSession() { return operate('session', 'get_session', arguments.length === 0 ? {} : null); },
-    call(tool, args = {}) { return operate('call', tool, args); },
+    call(tool, args = {}, options) { return operate('call', tool, args, options); },
     listWindows(pid) {
       return operate('windows', 'list_windows', arguments.length === 1 ? { pid } : null);
     },

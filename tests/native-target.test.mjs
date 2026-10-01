@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -139,6 +139,34 @@ function captureStep(bytes = frameA, overrides = {}, delayMs = 0) {
       ...overrides,
     }),
   };
+}
+
+const sha256 = base64 => createHash('sha256').update(Buffer.from(base64, 'base64')).digest('hex');
+
+// A Driver 0.31 + cua-perception 0.2.1 cua.visual_regions_v1 receipt for one 6x4 frameSeats capture.
+// The default 1568 px downscale reports an affine; edit(receipt) varies one field.
+function visualStep(capture_id, edit = () => {}) {
+  const hash = sha256(frameSeats);
+  const receipt = {
+    schema: 'cua.visual_regions_v1',
+    capture: {
+      capture_id, source: { kind: 'window', pid: 4107, window_id: 71 },
+      screenshot: { width: 6, height: 4, mime_type: 'image/png', reference: `png-sha256:${hash}`, sha256: hash },
+      action_coordinate_space: { kind: 'affine', m11: 1.632, m12: 0, m21: 0, m22: 1.63, tx: 0, ty: 0 },
+    },
+    parser: {
+      extension_id: 'cua-perception', extension_version: '0.2.1', model_id: 'pp-ocrv5-mobile-en', model_version: '5.0',
+      backend: 'onnxruntime-cpu',
+    },
+    regions: [
+      { id: 'text-0', kind: 'text', text: 'A3', bounds: { x: 2, y: 1, width: 3, height: 1 }, confidence: 0.852, interactive: false },
+      { id: 'icon-0', kind: 'icon', label: 'icon-class-0', bounds: { x: 0, y: 3, width: 1, height: 1 }, confidence: 0.41, interactive: false },
+    ],
+    timing: { duration_ms: 4100 },
+    warnings: [{ code: 'low_resolution', message: 'Native warning text is never returned.' }],
+  };
+  edit(receipt);
+  return { tool: 'parse_visual_regions', receipt };
 }
 
 function windowsStep(...windows) {
@@ -332,6 +360,49 @@ test('compact web-only evidence retains incomplete coverage and unknown element 
   } finally {
     await fixture.target.end();
   }
+});
+
+test('Driver 0.31 AX actions address only the current element_token, never the index/snapshot pair', async t => {
+  const legacy = [
+    { tool: 'click', args: { element_index: 1, snapshot_id: 'native-1' } },
+    { tool: 'click', args: { element_token: 'save-token', element_index: 1 } },
+    { tool: 'set_value', args: { element_token: 'save-token', snapshot_id: 'native-1', value: 'receipt-17' } },
+    { tool: 'type_text', args: { text: 'receipt-17', element_index: 1, snapshot_id: 'native-1' } },
+    { tool: 'press_key', args: { key: 'RETURN', element_index: 1, snapshot_id: 'native-1' } },
+  ];
+  const fixture = await createFixture(t, [
+    start, ...legacy.map(() => ({ tool: 'get_window_state', receipt: windowState() })),
+    { tool: 'get_window_state', receipt: windowState() }, { tool: 'click', receipt: axDelivered }, end,
+  ]);
+  const { target } = fixture;
+  try {
+    await target.start();
+    for (const action of legacy) {
+      const observed = await target.observe();
+      await rejectsWithoutDispatch(fixture, () => target.execute({ action }, observed));
+    }
+    assert.deepEqual(await target.execute(save, await target.observe()), axDelivered);
+  } finally {
+    await target.end();
+  }
+  assert.deepEqual((await fixture.dispatches()).filter(call => call.tool === 'click').map(call => call.args), [
+    { element_token: 'save-token', pid: 4107, window_id: 71, delivery_mode: 'background', session: 'owned-native' },
+  ]);
+});
+
+test('max_image_dimension admits 0 for native resolution and rejects other non-natural values', async t => {
+  const fixture = await createFixture(t, [start, captureStep(), end]);
+  try {
+    await fixture.target.start();
+    for (const max_image_dimension of [-1, 1.5, '0', null]) {
+      await rejectsWithoutDispatch(fixture, () => fixture.target.observe({ screenshot: true, max_image_dimension }));
+    }
+    await fixture.target.observe({ screenshot: true, max_image_dimension: 0 });
+  } finally {
+    await fixture.target.end();
+  }
+  const captures = (await fixture.dispatches()).filter(call => call.tool === 'get_window_state');
+  assert.deepEqual(captures.map(call => call.args.max_image_dimension), [0]);
 });
 
 test('animated A/B/B captures settle only after a measured consecutive quiet span', async t => {
@@ -811,6 +882,143 @@ test('regions re-hash the owned capture and report capture pixels without consum
   }
   const clicks = (await fixture.dispatches()).filter(call => call.tool === 'click');
   assert.deepEqual(clicks.map(call => [call.args.x, call.args.y]), [[3, 1]]);
+});
+
+test('visual regions keep capture PNG pixels, return the affine only as evidence, and leave the capture clickable', async t => {
+  const captures = [captureStep(frameSeats), captureStep(frameSeats)];
+  const capture_id = captures[1].receipt.capture_id;
+  const fixture = await createFixture(t, [
+    start, { tool: 'get_window_state', receipt: windowState() }, captureStep(frameSeats, { capture_id: undefined }),
+    ...captures, visualStep(capture_id), inPlace, { tool: 'click', receipt: pixelDelivered }, inPlace, end,
+  ]);
+  const { target } = fixture;
+  try {
+    await target.start();
+    const accessibilityOnly = await target.observe();
+    await rejectsWithoutDispatch(fixture, () => target.visualRegions(accessibilityOnly));
+    const unbound = await target.observe({ screenshot: true });
+    await rejectsWithoutDispatch(fixture, () => target.visualRegions(unbound));
+    const observation = await settleNow(target);
+    await rejectsWithoutDispatch(fixture, () => target.visualRegions(structuredClone(observation)));
+    for (const options of [
+      { kinds: [] }, { kinds: ['text', 'text'] }, { kinds: ['button'] }, { kinds: 'text' }, { maxRegions: 0 },
+      { maxRegions: 1.5 }, { minConfidence: -0.1 }, { minConfidence: 1.1 }, { minConfidence: Number.NaN }, { max_regions: 8 },
+    ]) await rejectsWithoutDispatch(fixture, () => target.visualRegions(observation, options));
+    const visual = await target.visualRegions(observation, { kinds: ['text', 'icon'], maxRegions: 8, minConfidence: 0.3 });
+    const [text] = visual.regions;
+    for (const value of [visual, visual.actionCoordinateSpace, visual.parser, visual.regions, text, text.bounds, text.anchor, visual.warnings]) {
+      assert.ok(Object.isFrozen(value));
+    }
+    assert.deepEqual(visual, {
+      capture_id, width: 6, height: 4, sha256: sha256(frameSeats),
+      actionCoordinateSpace: { kind: 'affine', m11: 1.632, m12: 0, m21: 0, m22: 1.63, tx: 0, ty: 0 },
+      parser: {
+        extension_id: 'cua-perception', extension_version: '0.2.1', model_id: 'pp-ocrv5-mobile-en', model_version: '5.0',
+        backend: 'onnxruntime-cpu',
+      },
+      regions: [
+        { id: 'text-0', kind: 'text', text: 'A3', bounds: { x: 2, y: 1, width: 3, height: 1 }, confidence: 0.852, anchor: { x: 3, y: 1 } },
+        { id: 'icon-0', kind: 'icon', label: 'icon-class-0', bounds: { x: 0, y: 3, width: 1, height: 1 }, confidence: 0.41, anchor: { x: 0, y: 3 } },
+      ],
+      warnings: [{ code: 'low_resolution' }],
+      durationMs: 4100,
+    });
+    // Parsing consumed neither the native capture nor the settled observation.
+    assert.deepEqual(await target.execute({ action: { tool: 'click', args: { ...text.anchor } } }, observation), pixelDelivered);
+    await rejectsWithoutDispatch(fixture, () => target.visualRegions(observation));
+  } finally {
+    await target.end();
+  }
+  assert.deepEqual((await fixture.dispatches()).filter(call => ['parse_visual_regions', 'click'].includes(call.tool)), [
+    { command: 'call', tool: 'parse_visual_regions', args: {
+      capture_id, options: { kinds: ['text', 'icon'], max_regions: 8, min_confidence: 0.3 }, session: 'owned-native',
+    } },
+    // The same capture binds the click with unscaled PNG pixels; only the Driver applies its affine.
+    { command: 'call', tool: 'click', args: {
+      x: 3, y: 1, pid: 4107, window_id: 71, delivery_mode: 'background', session: 'owned-native', capture_id,
+    } },
+  ]);
+});
+
+test('visual regions bind to the owned capture id, window, size, and hash', async t => {
+  const captures = [captureStep(frameSeats), captureStep(frameSeats)];
+  const capture_id = captures[1].receipt.capture_id;
+  const moved = sha256(frameSeatsMoved);
+  const mismatches = [
+    receipt => { receipt.capture.capture_id = 'capture-foreign'; },
+    receipt => { Object.assign(receipt.capture.screenshot, { sha256: moved, reference: `png-sha256:${moved}` }); },
+    receipt => { receipt.capture.source.pid = 4108; },
+    receipt => { receipt.capture.source.window_id = 72; },
+    receipt => { receipt.capture.source = { kind: 'primary_desktop', display_id: 'primary' }; },
+    receipt => { receipt.capture.screenshot.width = 7; },
+    receipt => { receipt.capture.screenshot.height = 5; },
+  ];
+  const fixture = await createFixture(t, [
+    start, ...captures, ...mismatches.map(edit => visualStep(capture_id, edit)), visualStep(capture_id),
+    captureStep(frameSeats), captureStep(frameSeats), end,
+  ]);
+  const { target } = fixture;
+  try {
+    await target.start();
+    const observation = await settleNow(target);
+    for (const index of mismatches.keys()) {
+      await assert.rejects(target.visualRegions(observation), { code: 'NATIVE_TARGET_ERROR', unknownOutcome: false },
+        `mismatch ${index}`);
+    }
+    // Refused receipts neither consumed nor invalidated the observation.
+    assert.equal((await target.visualRegions(observation)).capture_id, capture_id);
+    const tampered = await settleNow(target);
+    // A same-length valid PNG: only the recorded sha256 detects the swap, before any parse dispatch.
+    await writeFile(tampered.local.screenshot.file_path, Buffer.from(frameSeatsMoved, 'base64'));
+    await rejectsWithoutDispatch(fixture, () => target.visualRegions(tampered));
+    await rejectsWithoutDispatch(fixture, () => target.visualRegions(observation));
+  } finally {
+    await target.end();
+  }
+  assert.equal((await fixture.dispatches()).filter(call => call.tool === 'parse_visual_regions').length, mismatches.length + 1);
+});
+
+test('visual parse failures are definite and keep only the tool and an allowlisted refusal code', async t => {
+  const captures = [captureStep(frameSeats), captureStep(frameSeats)];
+  const parseFailure = code => ({ tool: 'parse_visual_regions', exitCode: 1,
+    stdout: JSON.stringify({ code, message: 'Native parse text stays private.', detail: 'worker detail', retryable: false }) });
+  const fixture = await createFixture(t, [
+    start, ...captures, parseFailure('not_installed'), parseFailure('mystery_failure'),
+    visualStep(captures[1].receipt.capture_id, receipt => { receipt.schema = 'cua.visual_regions_v2'; }), end,
+  ]);
+  const { target } = fixture;
+  const failure = error => ({ code: error.code, unknownOutcome: error.unknownOutcome, reason: error.reason,
+    tool: error.tool, refusalCode: error.refusalCode });
+  try {
+    await target.start();
+    const observation = await settleNow(target);
+    for (const refusalCode of ['not_installed', undefined]) {
+      await assert.rejects(target.visualRegions(observation), error => {
+        assert.deepEqual(failure(error), { code: 'NATIVE_TARGET_ERROR', unknownOutcome: false,
+          reason: 'visual_regions_unavailable', tool: 'parse_visual_regions', refusalCode });
+        assert.doesNotMatch(error.message, /private|worker detail/);
+        return true;
+      });
+    }
+    await assert.rejects(target.visualRegions(observation), { code: 'NATIVE_TARGET_ERROR', unknownOutcome: false });
+  } finally {
+    await target.end();
+  }
+  assert.equal((await fixture.dispatches()).filter(call => call.tool === 'parse_visual_regions').length, 3);
+});
+
+test('visual parses get their own 45 s budget beyond a shorter instance timeout', async t => {
+  const captures = [captureStep(frameSeats), captureStep(frameSeats)];
+  const fixture = await createFixture(t, [
+    start, ...captures, { ...visualStep(captures[1].receipt.capture_id), delayMs: 1500 }, end,
+  ], { timeoutMs: 1000 });
+  try {
+    await fixture.target.start();
+    const visual = await fixture.target.visualRegions(await settleNow(fixture.target));
+    assert.equal(visual.capture_id, captures[1].receipt.capture_id);
+  } finally {
+    await fixture.target.end();
+  }
 });
 
 test('verify reports only literal native satisfaction and consumes earlier evidence', async t => {

@@ -5,6 +5,7 @@ import { createCuaDriver } from './cua-driver.mjs';
 import { runBounded } from './jev-loop.mjs';
 import { createNativeTarget } from './native-target.mjs';
 import { observePreparedBrowser } from './owned-browser.mjs';
+import { labelRegions } from './visual.mjs';
 
 const READ_WAIT_MS = 8_000;
 const SIDE_EFFECTS = ['launched_browser', 'restarted_browser', 'created_profile', 'reused_driver_profile',
@@ -26,11 +27,17 @@ const CLEAR_ID = 'clear_selection';
 const REFUSALS = new Set(['target_occluded', 'target_moved', 'target_missing', 'target_offscreen', 'guard_unavailable']);
 const REASONS = new Set([...REFUSALS, 'target_moved_during_dispatch', 'guard_unavailable_after_dispatch',
   'pixel_routed_to_accessibility']);
+// Visual mode: missing prerequisites stop before any click and report status:"blocked".
+const BLOCKED = new Set(['JUDGE_REQUIRED', 'PERCEPTION_NOT_INSTALLED']);
+// OCR text is untrusted; only short label-shaped text reaches the judge or the report.
+const OCR_LABEL = /^[A-Za-z0-9]{1,8}$/;
+const REFUSAL_CODE = /^[a-z][a-z0-9_]{0,63}$/;
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = value => typeof value === 'string' && value.length > 0;
 const natural = value => Number.isSafeInteger(value) && value >= 0;
 const positive = value => Number.isSafeInteger(value) && value > 0;
 const seatID = seat => `select_${seat.toLowerCase()}`;
+const ocrLabel = value => typeof value === 'string' && OCR_LABEL.test(value.trim()) ? value.trim() : null;
 const seatColour = (r, g, b, a) => Math.abs(r - SEAT_RGB[0]) <= SEAT_RGB_TOLERANCE
   && Math.abs(g - SEAT_RGB[1]) <= SEAT_RGB_TOLERANCE && Math.abs(b - SEAT_RGB[2]) <= SEAT_RGB_TOLERANCE
   && (a === undefined || a === 255);
@@ -62,7 +69,7 @@ function sanitizedFailure(error, phase, session, unknownOutcome = false) {
       ? error.code : 'DEMO_OPERATION_FAILED',
     unknownOutcome: unknownOutcome || error?.unknownOutcome === true,
     exitCode: natural(error?.exitCode) ? error.exitCode : null,
-    refusalCode: error?.code === 'CUA_DRIVER_ERROR' && typeof error.refusalCode === 'string'
+    refusalCode: (error?.code === 'CUA_DRIVER_ERROR' || error instanceof DemoFailure) && typeof error.refusalCode === 'string'
       ? error.refusalCode : null,
     reason,
     advice: phase === 'end_session' || phase === 'native_end'
@@ -70,7 +77,9 @@ function sanitizedFailure(error, phase, session, unknownOutcome = false) {
       : REFUSALS.has(reason) && error.unknownOutcome === false
         ? 'The native geometry guard refused before dispatch. Keep the owned window unobstructed and stationary, '
           + 'then rerun the whole demo; never replay into another window.'
-        : 'Inspect this phase and its scoped evidence. Do not replay a mutation, widen scope, or change daemon permissions automatically.',
+        : error?.code === 'PERCEPTION_NOT_INSTALLED'
+          ? 'The optional cua-perception extension is not installed. Installing it is an operator decision; never install it automatically.'
+          : 'Inspect this phase and its scoped evidence. Do not replay a mutation, widen scope, or change daemon permissions automatically.',
   };
 }
 
@@ -251,9 +260,37 @@ function seatRegions(result, screenshot, layout) {
       && [region.width, region.height].every(size => size >= 0.8 * diameter && size <= diameter + tolerance)
       && region.area >= 0.6 * Math.PI * (seat.radius * scale) ** 2;
   }), 'SEAT_REGIONS_MISMATCH');
-  return regions.map((region, index) => ({ seat: layout[index].seat,
+  const seats = regions.map((region, index) => ({ seat: layout[index].seat,
     anchor: { x: region.anchor.x, y: region.anchor.y }, center: { x: region.center.x, y: region.center.y },
     bounds: { x: region.x, y: region.y, width: region.width, height: region.height }, area: region.area }));
+  return { seats, scale };
+}
+
+/**
+ * Visual-mode seat candidates for geometry-mapped seats in left-to-right order (seatRegions).
+ * IDs are neutral positions (seat_1..seat_n) that never name a seat. Descriptions and state carry
+ * only label-shaped OCR text as untrusted evidence; ambiguous or other text reads as unreadable.
+ * seatOf maps each ID to its geometry seat, the only seat identity authorization may use.
+ */
+export function visualSeatCandidates(seats, labels) {
+  requireThat(Array.isArray(seats) && Array.isArray(labels) && seats.length === labels.length
+    && seats.length <= 24, 'VISUAL_LABELS_MISMATCH');
+  const candidates = [];
+  const state = [];
+  const seatOf = new Map();
+  seats.forEach((item, index) => {
+    const id = `seat_${index + 1}`;
+    const ambiguous = labels[index]?.ambiguous === true;
+    const label = ambiguous ? null : ocrLabel(labels[index]?.ocrText);
+    const evidence = label !== null ? `whose on-canvas label reads ${JSON.stringify(label)} (OCR text, untrusted)`
+      : ambiguous ? 'whose on-canvas label is ambiguous (OCR, untrusted)' : 'with no readable on-canvas label';
+    candidates.push({ id,
+      description: `Select the available seat ${evidence} once with one foreground click inside its detected canvas region.`,
+      action: { tool: 'click', args: { x: item.anchor.x, y: item.anchor.y, delivery_mode: 'foreground' } } });
+    state.push({ id, ocrLabel: label, ambiguous });
+    seatOf.set(id, item);
+  });
+  return { candidates, state, seatOf };
 }
 
 /**
@@ -267,8 +304,28 @@ function seatRegions(result, screenshot, layout) {
  * permission changes, no mutation retries. Guard refusals report status:"refused".
  * success requires task proof AND both session ends, fixture closure and
  * returned-PID/profile cleanup.
+ *
+ * visual:true (requires a judge) is a live vision-assisted judge selection
+ * on the same fixture: after the colour-region geometry check, read-only
+ * parse_visual_regions (optional cua-perception) reads the settled capture's
+ * text and labelRegions associates one label below each disc. Candidates are
+ * neutral seat_1..seat_n (left to right) with untrusted OCR label evidence; the
+ * judge chooses the seat (no deterministicId) and Clear stays deterministic.
+ * authorize admits only the candidate whose geometry seat is the requested seat,
+ * so a wrong choice is denied without a click. A warm-up parse on a throwaway,
+ * never-settled capture precedes the final settle, keeping the worker warm
+ * (idle TTL ~30 s) so only one warm parse plus the judge count against the
+ * settled capture's 15 s age gate.
+ * One extra decision (maxSteps 3) admits a stale or judge-requested
+ * reobservation; authorize still admits one seat click and one clear.
+ * Judge failures, abstentions and denials report phase "judge_choice".
+ * Results add deterministic:false and visual {parse, labels, recall, judge,
+ * warmUp, parses}; ocrText keeps only label-shaped text, otherwise null.
+ * not_installed reports status:"blocked" PERCEPTION_NOT_INSTALLED before any
+ * click; abstained, denied and limit without a click report the loop status.
  */
-export async function runCanvasDemo({ judge = unavailableJudge, onProgress, binary = 'cua-driver', seat } = {}) {
+export async function runCanvasDemo({ judge = unavailableJudge, onProgress, binary = 'cua-driver', seat,
+  visual = false } = {}) {
   const startedAt = performance.now();
   let phase = 'configuration';
   let driver = null;
@@ -292,6 +349,8 @@ export async function runCanvasDemo({ judge = unavailableJudge, onProgress, bina
   let taskFailure = null;
   let loopResult = null;
   let finalServer = null;
+  let seatChoice = null;
+  const visualReport = visual ? { parse: null, labels: [], recall: null, judge: null, warmUp: null, parses: 0 } : null;
   const evidenceOf = new WeakMap();
   const counts = { select: 0, clear: 0, observations: 0, snapshots: 0 };
   let judgeCalls = 0;
@@ -329,10 +388,13 @@ export async function runCanvasDemo({ judge = unavailableJudge, onProgress, bina
     const observation = { id: `${targetID}/${tabID}/${evidence.snapshot.id}`, observedAt, state: {
       stage, targetID: evidence.targetID, tabID: evidence.tabID, pageURL: evidence.pageURL,
       snapshot: evidence.snapshot, status: evidence.status, clearControl: actionable(evidence.clear, 'click'), server,
-      seats: pixels === null ? null : pixels.seats.map(item => ({ seat: item.seat, x: item.anchor.x, y: item.anchor.y })),
+      // Visual mode keeps seat names out of judge-visible state; only neutral IDs and OCR evidence.
+      seats: pixels === null ? null : pixels.labels === null
+        ? pixels.seats.map(item => ({ seat: item.seat, x: item.anchor.x, y: item.anchor.y }))
+        : visualSeatCandidates(pixels.seats, pixels.labels).state,
     } };
     evidenceOf.set(observation, { evidence, captureId: pixels?.captureId ?? null,
-      nativeObservation: pixels?.nativeObservation ?? null, seats: pixels?.seats ?? null });
+      nativeObservation: pixels?.nativeObservation ?? null, seats: pixels?.seats ?? null, labels: pixels?.labels ?? null });
     lastObservation = observation;
     return observation;
   }
@@ -378,6 +440,64 @@ export async function runCanvasDemo({ judge = unavailableJudge, onProgress, bina
     const title = observation?.state?.window_title;
     return typeof title === 'string' && (title === PAGE_TITLE || title.startsWith(`${PAGE_TITLE} - `));
   }
+  // Read-only text parse; it neither consumes the capture nor invalidates the observation.
+  async function parseText(observation) {
+    const started = performance.now();
+    let result;
+    try { result = await nativeTarget.visualRegions(observation, { kinds: ['text'] }); }
+    catch (error) {
+      const refusalCode = error?.code === 'NATIVE_TARGET_ERROR' && typeof error.refusalCode === 'string'
+        && REFUSAL_CODE.test(error.refusalCode) ? error.refusalCode : null;
+      const failure = new DemoFailure(refusalCode === 'not_installed' ? 'PERCEPTION_NOT_INSTALLED'
+        : error?.code === 'NATIVE_TARGET_ERROR' && error.reason === 'visual_regions_unavailable'
+          ? 'VISUAL_REGIONS_UNAVAILABLE' : 'VISUAL_REGIONS_INVALID');
+      if (refusalCode !== null) failure.refusalCode = refusalCode;
+      throw failure;
+    }
+    visualReport.parses++;
+    const space = result?.actionCoordinateSpace?.kind;
+    const parser = result?.parser;
+    return { result, parse: { durationMs: Number.isFinite(result?.durationMs) ? result.durationMs : null,
+      wallMs: Math.round(performance.now() - started),
+      regionCount: Array.isArray(result?.regions) ? result.regions.length : null,
+      actionCoordinateSpaceKind: space === 'screenshot_pixels' || space === 'affine' ? space : null,
+      parser: { extension_version: text(parser?.extension_version) ? parser.extension_version : null,
+        model_id: text(parser?.model_id) ? parser.model_id : null } } };
+  }
+  // Visual mode: one OCR label below each geometry-mapped disc of the settled capture. Each label's centre is
+  // painted 16 CSS px below its disc's bottom edge, so one disc radius in capture pixels bounds the gap.
+  async function seatLabels(settled, mapped) {
+    const screenshot = settled.local.screenshot;
+    const { result, parse } = await parseText(settled);
+    visualReport.parse = parse;
+    requireThat(record(result) && result.capture_id === screenshot.capture_id && result.width === screenshot.width
+      && result.height === screenshot.height && Array.isArray(result.regions), 'VISUAL_CAPTURE_MISMATCH');
+    const maxGap = Math.min(...layout.map(item => item.radius)) * mapped.seatScale;
+    let associated;
+    try {
+      associated = labelRegions(mapped.seats.map(item => ({ bounds: item.bounds, anchor: item.anchor })), result,
+        { direction: 'below', maxGap });
+    } catch { throw new DemoFailure('VISUAL_LABELS_INVALID'); }
+    requireThat(Array.isArray(associated) && associated.length === mapped.seats.length
+      && associated.every((item, index) => record(item) && item.index === index && typeof item.ambiguous === 'boolean'),
+    'VISUAL_LABELS_INVALID');
+    const labels = associated.map(item => ({ ocrText: ocrLabel(item.text),
+      confidence: Number.isFinite(item.confidence) ? item.confidence : null, ambiguous: item.ambiguous }));
+    visualReport.labels = labels.map((label, index) => ({ seat: mapped.seats[index].seat, ...label,
+      agrees: !label.ambiguous && label.ocrText === mapped.seats[index].seat }));
+    visualReport.recall = visualReport.labels.filter(label => label.agrees).length / labels.length;
+    return labels;
+  }
+  // Visual report only. The answer is untrusted: read own data properties, never getters.
+  function recordJudge(answer) {
+    const field = (value, key) => record(value) ? Object.getOwnPropertyDescriptor(value, key)?.value : undefined;
+    const action = field(answer, 'action');
+    const choice = field(action, 'choice');
+    const confidence = field(action, 'confidence');
+    const item = typeof choice === 'string' ? localTable?.seats.get(choice) : undefined;
+    visualReport.judge = { choice: typeof choice === 'string' && /^[a-z][a-z0-9_-]{0,47}$/.test(choice) ? choice : null,
+      correct: item !== undefined && item.seat === requestedSeat, confidence: Number.isFinite(confidence) ? confidence : null };
+  }
   async function observeSeats() {
     await at('observe_fixture', () => awaitSemantic(NO_SELECTION, semanticReady, 'FIXTURE_NOT_READY'));
     const settled = await at('settle_window', async () => {
@@ -398,7 +518,7 @@ export async function runCanvasDemo({ judge = unavailableJudge, onProgress, bina
         'FIXTURE_NOT_READY');
       return result;
     });
-    return at('map_seat_regions', async () => {
+    const mapped = await at('map_seat_regions', async () => {
       const screenshot = settled.local.screenshot;
       requireThat(record(screenshot) && text(screenshot.capture_id), 'CAPTURE_BINDING_MISSING');
       // A noise floor well below one seat disc at the capture's PNG pixels per window point (the
@@ -414,10 +534,13 @@ export async function runCanvasDemo({ judge = unavailableJudge, onProgress, bina
         width: positive(result?.width) ? result.width : null, height: positive(result?.height) ? result.height : null,
         truncated: typeof result?.truncated === 'boolean' ? result.truncated : null,
         count: Array.isArray(result?.regions) ? result.regions.length : null, minArea, seats: null };
-      const seats = seatRegions(result, screenshot, layout);
+      const { seats, scale: seatScale } = seatRegions(result, screenshot, layout);
       native.target.regions.seats = seats;
-      return wrap(current.evidence, current.server, { captureId: result.capture_id, nativeObservation: settled, seats });
+      return { captureId: result.capture_id, seats, seatScale };
     }, false, nativeSession);
+    const labels = visual ? await at('visual_regions', () => seatLabels(settled, mapped), false, nativeSession) : null;
+    return wrap(current.evidence, current.server, { captureId: mapped.captureId, nativeObservation: settled,
+      seats: mapped.seats, labels });
   }
   async function observeOutcome() {
     const selecting = stage === 'select';
@@ -442,13 +565,21 @@ export async function runCanvasDemo({ judge = unavailableJudge, onProgress, bina
     const entry = evidenceOf.get(observation);
     const state = observation.state;
     const candidates = [];
+    let seats = new Map();
     if (entry !== undefined && lastObservation === observation) {
       if (stage === 'ready' && state.stage === 'ready' && counts.select === 0 && counts.clear === 0
-        && entry.seats !== null && semanticReady(entry.evidence, state.server)) {
-        for (const item of entry.seats) {
-          candidates.push({ id: seatID(item.seat),
-            description: `Select available seat ${item.seat} once with one foreground click inside its detected canvas region.`,
-            action: { tool: 'click', args: { x: item.anchor.x, y: item.anchor.y, delivery_mode: 'foreground' } } });
+        && entry.seats !== null && (!visual || entry.labels !== null) && semanticReady(entry.evidence, state.server)) {
+        if (visual) {
+          const table = visualSeatCandidates(entry.seats, entry.labels);
+          candidates.push(...table.candidates);
+          seats = table.seatOf;
+        } else {
+          for (const item of entry.seats) {
+            candidates.push({ id: seatID(item.seat),
+              description: `Select available seat ${item.seat} once with one foreground click inside its detected canvas region.`,
+              action: { tool: 'click', args: { x: item.anchor.x, y: item.anchor.y, delivery_mode: 'foreground' } } });
+            seats.set(seatID(item.seat), item);
+          }
         }
       } else if (stage === 'select' && state.stage === 'select' && selectionVerified && counts.select === 1
         && counts.clear === 0 && actionable(entry.evidence.clear, 'click')
@@ -459,12 +590,14 @@ export async function runCanvasDemo({ judge = unavailableJudge, onProgress, bina
             input_route: 'dom_event' } } });
       }
     }
-    localTable = { observation, entries: new Map(candidates.map(candidate => [candidate.id, candidate])) };
+    // seats maps each seat candidate ID to its geometry seat: the only seat identity authorize uses.
+    localTable = { observation, entries: new Map(candidates.map(candidate => [candidate.id, candidate])), seats };
     return candidates;
   }
   function deterministicId(observation, candidates) {
     if (localTable?.observation !== observation) return null;
-    const id = stage === 'ready' ? seatID(requestedSeat) : stage === 'select' ? CLEAR_ID : null;
+    // Visual mode leaves the seat choice to the judge; Clear stays deterministic.
+    const id = stage === 'ready' ? (visual ? null : seatID(requestedSeat)) : stage === 'select' ? CLEAR_ID : null;
     const candidate = candidates.find(item => item.id === id);
     return candidate !== undefined && localTable.entries.get(id) === candidate ? id : null;
   }
@@ -476,10 +609,12 @@ export async function runCanvasDemo({ judge = unavailableJudge, onProgress, bina
       || entry === undefined || state.targetID !== targetID || state.tabID !== tabID
       || state.pageURL !== fixture.url || !state.snapshot.complete
       || !exactObject(candidate.action, { tool: expected.action.tool, args: expected.action.args })) return false;
-    if (candidate.id === seatID(requestedSeat)) {
-      const item = entry.seats?.find(seatItem => seatItem.seat === requestedSeat);
-      return candidate.action.tool === 'click' && stage === 'ready' && state.stage === 'ready'
-        && counts.select === 0 && counts.clear === 0 && item !== undefined && text(entry.captureId)
+    // Independent of OCR and the judge: the candidate's geometry seat must be the requested seat.
+    const item = localTable.seats.get(candidate.id);
+    if (item !== undefined) {
+      return item.seat === requestedSeat && entry.seats?.includes(item) === true
+        && candidate.action.tool === 'click' && stage === 'ready' && state.stage === 'ready'
+        && counts.select === 0 && counts.clear === 0 && text(entry.captureId)
         && entry.nativeObservation?.local?.screenshot?.capture_id === entry.captureId
         && semanticReady(entry.evidence, serverState(fixture))
         && exactObject(candidate.action.args, { x: item.anchor.x, y: item.anchor.y, delivery_mode: 'foreground' });
@@ -498,6 +633,7 @@ export async function runCanvasDemo({ judge = unavailableJudge, onProgress, bina
     requireThat(authorize(candidate, observation), 'ACTION_NOT_AUTHORIZED');
     const entry = evidenceOf.get(observation);
     const seatClick = candidate.id !== CLEAR_ID;
+    if (seatClick) seatChoice = candidate.id;
     stage = seatClick ? 'select' : 'clear';
     counts[stage]++;
     const { tool, args } = candidate.action;
@@ -542,7 +678,7 @@ export async function runCanvasDemo({ judge = unavailableJudge, onProgress, bina
       && state.targetID === targetID && state.tabID === tabID && state.pageURL === fixture.url
       && state.snapshot.complete;
     let verified = false;
-    if (candidate.id === seatID(requestedSeat)) {
+    if (candidate.id !== CLEAR_ID && candidate.id === seatChoice) {
       selectionVerified = fresh && stage === 'select' && state.stage === 'select' && counts.select === 1
         && counts.clear === 0 && selectedState(state.server, requestedSeat)
         && state.status === `${STATUS_PREFIX}${requestedSeat}`;
@@ -561,7 +697,9 @@ export async function runCanvasDemo({ judge = unavailableJudge, onProgress, bina
 
   try {
     requireThat(typeof judge === 'function' && (onProgress === undefined || typeof onProgress === 'function')
-      && (seat === undefined || (typeof seat === 'string' && SEAT_PATTERN.test(seat))), 'INVALID_DEMO_OPTIONS');
+      && (seat === undefined || (typeof seat === 'string' && SEAT_PATTERN.test(seat)))
+      && typeof visual === 'boolean', 'INVALID_DEMO_OPTIONS');
+    requireThat(!visual || judge !== unavailableJudge, 'JUDGE_REQUIRED');
     driver = createCuaDriver({ binary });
     // The loopback fixture is local; seat scope is settled before any daemon side effect.
     fixture = await at('fixture_start', createCanvasFixture);
@@ -646,13 +784,32 @@ export async function runCanvasDemo({ judge = unavailableJudge, onProgress, bina
       native.target.focus = { accepted: true };
     }, true, nativeSession);
     await progress('window_focused');
+    if (visual) {
+      // Warm the perception worker (cold start up to ~15 s, idle TTL ~30 s) on a throwaway capture before the
+      // final settle; settle() supersedes it, so it never authorizes a click and the 15 s age gate of the
+      // settled capture covers only one warm parse plus the judge.
+      await at('perception_warmup', async () => {
+        const observation = await nativeTarget.observe({ screenshot: true });
+        counts.observations++;
+        visualReport.warmUp = (await parseText(observation)).parse;
+      }, false, nativeSession);
+    }
     loopResult = await runBounded({
-      judge: async (...args) => { judgeCalls++; return judge(...args); },
-      goal: `Select only seat ${requestedSeat} once on this owned localhost canvas fixture, verify server state and `
-        + 'typed-browser semantic status, then clear the selection once and verify it cleared.',
+      judge: async (...args) => {
+        judgeCalls++;
+        if (!visual) return judge(...args);
+        return at('judge_choice', async () => {
+          const answer = await judge(...args);
+          recordJudge(answer);
+          return answer;
+        });
+      },
+      goal: `Select only ${visual ? 'the seat labelled' : 'seat'} ${requestedSeat} once on this owned localhost canvas `
+        + 'fixture, verify server state and typed-browser semantic status, then clear the selection once and verify it cleared.',
       observe, getCandidates, authorize, execute, verify, isDone: done, deterministicId,
-      // One seat click and one clear click at most; an unknown outcome is never retried.
-      maxSteps: 2,
+      // One seat click and one clear click at most; an unknown outcome is never retried. Visual mode admits
+      // one more decision for a stale or judge-requested reobservation; authorize still counts the clicks.
+      maxSteps: visual ? 3 : 2,
       // Leave confidence, probability and observation-age gates unchanged.
     });
     if (loopResult.status !== 'complete' || !done(lastObservation)) {
@@ -722,12 +879,19 @@ export async function runCanvasDemo({ judge = unavailableJudge, onProgress, bina
   // A refusal is reported only when the guard refused before dispatch and the server saw no click.
   const refused = !taskComplete && refusal !== null && loopResult?.status === 'unknown' && counts.select === 1
     && counts.clear === 0 && finalServer !== null && untouched(finalServer);
+  // Visual mode only: a stop before any click (server untouched) reports its own status.
+  const clickless = counts.select === 0 && (finalServer === null || untouched(finalServer));
+  const blocked = visual && !taskComplete && BLOCKED.has(taskFailure?.code) && clickless;
+  const stopped = visual && !taskComplete && !refused && !blocked && clickless && finalServer !== null
+    && ['abstained', 'denied', 'limit'].includes(loopResult?.status) ? loopResult.status : null;
   const success = taskComplete && cleanup.complete;
   return {
-    success, status: success ? 'complete' : taskComplete ? 'cleanup_incomplete' : refused ? 'refused' : 'failed',
-    reason: refused ? refusal.reason : null, session: session(), nativeSession: nativeSession(),
-    elapsedMs: Math.round(performance.now() - startedAt), judgeCalls, deterministic: true, counts, native,
-    task: { complete: taskComplete, status: refused ? 'refused' : loopResult?.status ?? 'failed', seat: requestedSeat,
+    success, status: success ? 'complete' : taskComplete ? 'cleanup_incomplete' : refused ? 'refused'
+      : blocked ? 'blocked' : stopped ?? 'failed',
+    reason: refused ? refusal.reason : blocked ? taskFailure.code : null, session: session(), nativeSession: nativeSession(),
+    elapsedMs: Math.round(performance.now() - startedAt), judgeCalls, deterministic: !visual, counts, native,
+    task: { complete: taskComplete, status: refused ? 'refused' : blocked ? 'blocked' : loopResult?.status ?? 'failed',
+      seat: requestedSeat,
       failure: taskFailure, refusal: refused ? refusal : null,
       unknownOutcome: !refused && (taskFailure?.unknownOutcome === true || loopResult?.status === 'unknown'
         || loopResult?.status === 'unverified'),
@@ -740,6 +904,7 @@ export async function runCanvasDemo({ judge = unavailableJudge, onProgress, bina
         })),
       } },
     cleanup,
+    ...(visual ? { visual: visualReport } : {}),
   };
 }
 

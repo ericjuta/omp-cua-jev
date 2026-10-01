@@ -6,13 +6,19 @@ import { journalDirectory, readJournal } from './journal.mjs';
 
 const MINIMUM_BUN = '1.3.14';
 const MINIMUM_OMP = '18.2.7';
-const TESTED_DRIVER = '0.30.2-nightly.20260927.36294544935';
+const TESTED_DRIVER = '0.31.0';
 const TIMEOUT_MS = 5_000;
+// extension status re-verifies the installed artifact (observed 3.8-4.7 s for cua-perception 0.2.1).
+const EXTENSION_STATUS_TIMEOUT_MS = 15_000;
 const MAX_BUFFER = 64 * 1024;
-const RESOURCE_NAMES = ['loop', 'driver', 'native', 'pixels', 'sessions', 'demo', 'canvasDemo', 'probe', 'skill'];
+const RESOURCE_NAMES = [
+  'loop', 'driver', 'native', 'pixels', 'sessions', 'demo', 'canvasDemo', 'visual', 'ocrEval', 'judgeEval', 'probe', 'skill',
+];
 const DIRECT_CAPTURE_STATES = new Set([
   'ready', 'unavailable', 'timed_out', 'probe_failed', 'blocked_by_screen_recording', 'not_checked',
 ]);
+const PERCEPTION_ID = 'cua-perception';
+const PERCEPTION_TRUST = 'publisher-verified';
 
 function version(value) {
   if (typeof value !== 'string' || value.length > 120) return null;
@@ -31,13 +37,13 @@ function meetsMinimum(actual, minimum) {
   return !actual.split('+', 1)[0].includes('-');
 }
 
-function run(binary, args) {
+function run(binary, args, timeoutMs = TIMEOUT_MS) {
   return new Promise(resolve => {
     try {
       execFile(binary, args, {
         shell: false,
         encoding: 'utf8',
-        timeout: TIMEOUT_MS,
+        timeout: timeoutMs,
         maxBuffer: MAX_BUFFER,
         killSignal: 'SIGKILL',
       }, (error, stdout, stderr) => {
@@ -146,26 +152,73 @@ function leadingObject(text) {
   return null;
 }
 
-function clickInputSchema(result) {
+// Returns the described tool's `{ name, schema }`, or null without a recognizable input schema.
+// `name` is the declared tool name (JSON `name`, or the first prose `name:` line before the schema), else null.
+function describeTool(result) {
   if (result.state !== 'ok') return null;
   try {
     const payload = JSON.parse(result.stdout);
     if (isObject(payload)) {
-      return isObject(payload.input_schema) ? payload.input_schema
+      const schema = isObject(payload.input_schema) ? payload.input_schema
         : isObject(payload.inputSchema) ? payload.inputSchema : null;
+      return schema ? { name: typeof payload.name === 'string' ? payload.name : null, schema } : null;
     }
   } catch { /* The inspected CLI prints prose, then an `input_schema:` line followed by the JSON schema. */ }
   const marker = /^input_schema:[ \t]*\r?$/m.exec(result.stdout);
   const schema = marker ? leadingObject(result.stdout.slice(marker.index + marker[0].length)) : null;
-  return isObject(schema) ? schema : null;
+  if (!isObject(schema)) return null;
+  const name = /^name:[ \t]*(\S.*?)[ \t]*\r?$/m.exec(result.stdout.slice(0, marker.index));
+  return { name: name ? name[1] : null, schema };
 }
 
-function captureBoundPixels(result) {
-  // Only a declared input property counts. Description prose that mentions capture_id does not.
-  const properties = clickInputSchema(result)?.properties;
+// Only a declared input property counts. Description prose that mentions a field does not.
+// A boolean `true` subschema also declares the property; `false` forbids it.
+function declaresProperty(properties, name) {
+  return Object.hasOwn(properties, name) && (isObject(properties[name]) || properties[name] === true);
+}
+
+// Driver 0.31.0 element actions take only `element_token`; the legacy index/snapshot pair is rejected.
+// Null when the click schema is unrecognized.
+function elementTokens(properties) {
   if (!isObject(properties)) return null;
-  // A boolean `true` subschema also declares the property; `false` forbids it.
-  return Object.hasOwn(properties, 'capture_id') && (isObject(properties.capture_id) || properties.capture_id === true);
+  return declaresProperty(properties, 'element_token')
+    && !declaresProperty(properties, 'element_index') && !declaresProperty(properties, 'snapshot_id');
+}
+
+// Null unless `describe parse_visual_regions` yields that tool's input schema; then whether it takes capture_id.
+function visualRegionsAdvertised(result) {
+  const tool = describeTool(result);
+  const properties = tool?.schema.properties;
+  if (!isObject(properties) || (tool.name !== null && tool.name !== 'parse_visual_regions')) return null;
+  return declaresProperty(properties, 'capture_id');
+}
+
+// Short identifier-like strings only, so free-form child output never reaches the report.
+function identifier(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._+-]{0,79}$/.test(value) ? value : null;
+}
+
+/**
+ * Reads `extension status cua-perception --json` (never `--self-test`, which launches the worker).
+ * Null when the command or payload is unrecognized; individual unrecognized fields stay null.
+ * A nonzero exit is trusted only for a report that the extension is absent or unhealthy.
+ */
+function perceptionExtension(result) {
+  if (result.state !== 'ok' && result.state !== 'failed') return null;
+  let payload;
+  try { payload = JSON.parse(result.stdout); } catch { return null; }
+  if (!isObject(payload) || payload.id !== PERCEPTION_ID) return null;
+  if (payload.isError === true || payload.success === false || payload.error != null || payload.refusal != null) return null;
+  const flag = value => typeof value === 'boolean' ? value : null;
+  const extension = {
+    installed: flag(payload.installed),
+    healthy: flag(payload.healthy),
+    activeVersion: version(payload.active_version),
+    trust: identifier(payload.trust),
+    evidenceClass: identifier(payload.evidence_class),
+  };
+  if (result.state === 'failed' && extension.installed !== false && extension.healthy !== false) return null;
+  return extension;
 }
 
 async function resourceStatus(paths) {
@@ -251,18 +304,29 @@ export async function doctor({ host, paths, binary = 'cua-driver' } = {}) {
 
   const validBinary = typeof binary === 'string' && binary.trim().length > 0 && !binary.includes('\0');
   const skipped = { state: 'invalid_binary', exitCode: null, stdout: '', stderr: '' };
-  const [versionResult, statusResult, permissionsResult, describeResult] = validBinary
+  const [
+    versionResult, statusResult, permissionsResult, describeResult, extensionStatusResult, describeParseResult,
+  ] = validBinary
     ? await Promise.all([
       run(binary, ['--version']),
       run(binary, ['status']),
       run(binary, ['permissions', 'status', '--json']),
       run(binary, ['describe', 'click']),
-    ]) : [skipped, skipped, skipped, skipped];
+      run(binary, ['extension', 'status', PERCEPTION_ID, '--json'], EXTENSION_STATUS_TIMEOUT_MS),
+      run(binary, ['describe', 'parse_visual_regions']),
+    ]) : [skipped, skipped, skipped, skipped, skipped, skipped];
   const driverVersion = versionResult.state === 'ok' && versionResult.stdout.startsWith('cua-driver ')
     ? version(versionResult.stdout.slice('cua-driver '.length)) : null;
   const daemon = daemonStatus(statusResult);
   const permissions = permissionStatus(permissionsResult);
-  const captureBound = captureBoundPixels(describeResult);
+  const clickProperties = describeTool(describeResult)?.schema.properties;
+  const captureBound = isObject(clickProperties) ? declaresProperty(clickProperties, 'capture_id') : null;
+  const tokens = elementTokens(clickProperties);
+  const visualRegions = {
+    advertised: visualRegionsAdvertised(describeParseResult),
+    extension: perceptionExtension(extensionStatusResult),
+  };
+  const perception = visualRegions.extension;
   if (versionResult.state !== 'ok') issue(blocking, 'CUA_CLI_UNAVAILABLE',
     'The Cua Driver version command did not complete successfully.',
     'Install or repair Cua Driver using the official setup instructions linked in README, then rerun doctor.');
@@ -273,6 +337,23 @@ export async function doctor({ host, paths, binary = 'cua-driver' } = {}) {
     'The click schema from cua-driver describe click does not declare capture_id; capture-bound pixel clicks are unavailable.');
   else if (versionResult.state === 'ok' && captureBound === null) issue(warnings, 'CAPTURE_BOUND_PIXELS_UNKNOWN',
     'The click schema from cua-driver describe click was not recognized; capture-bound pixel support is unknown.');
+  if (isObject(clickProperties) && !declaresProperty(clickProperties, 'element_token')) issue(blocking, 'ELEMENT_TOKENS_UNSUPPORTED',
+    'The click schema from cua-driver describe click does not declare element_token; this plugin addresses AX elements only by element_token.',
+    `Have the operator install the tested Cua Driver ${TESTED_DRIVER} through the official channel. Do not restart a shared daemon without authorization.`);
+  // Visual regions and the cua-perception extension are optional: these findings never block.
+  if (versionResult.state === 'ok' && visualRegions.advertised !== true) issue(warnings, 'VISUAL_REGIONS_UNADVERTISED',
+    'cua-driver describe parse_visual_regions did not declare a capture_id input; visual regions are unavailable or unknown.');
+  if (versionResult.state === 'ok' && perception === null) issue(warnings, 'PERCEPTION_STATUS_UNKNOWN',
+    'The optional cua-perception extension status was unavailable or not recognized.');
+  else if (perception?.installed === false) issue(warnings, 'PERCEPTION_NOT_INSTALLED',
+    'The optional cua-perception extension is not installed; visual regions are unavailable.',
+    'Visual regions are optional. A human may review and install the publisher-signed cua-perception catalog; doctor never installs it.');
+  else if (perception?.installed === true) {
+    if (perception.healthy !== true) issue(warnings, 'PERCEPTION_UNHEALTHY',
+      'The optional cua-perception extension did not report a healthy installation.');
+    if (perception.trust !== PERCEPTION_TRUST) issue(warnings, 'PERCEPTION_TRUST_UNVERIFIED',
+      'The optional cua-perception extension did not report publisher-verified trust.');
+  }
   if (daemon.state !== 'listening') issue(blocking, 'CUA_DAEMON_UNAVAILABLE',
     'A listening Cua Driver daemon was not established by status.',
     'Have the operator complete standard Cua onboarding. On macOS use the installed CuaDriver app through LaunchServices; preserve any existing launch flags during authorized recovery.');
@@ -313,16 +394,19 @@ export async function doctor({ host, paths, binary = 'cua-driver' } = {}) {
       testedDriver: TESTED_DRIVER,
       testedDriverMatch: driverVersion ? driverVersion === TESTED_DRIVER : null,
       commandTimeoutMs: TIMEOUT_MS,
+      extensionStatusTimeoutMs: EXTENSION_STATUS_TIMEOUT_MS,
       commands: {
         version: commandResult(versionResult),
         status: commandResult(statusResult),
         permissions: commandResult(permissionsResult),
         describe: commandResult(describeResult),
+        extensionStatus: commandResult(extensionStatusResult),
+        describeParse: commandResult(describeParseResult),
       },
       daemon,
       permissions,
     },
-    capabilities: { captureBoundPixels: captureBound },
+    capabilities: { captureBoundPixels: captureBound, elementTokens: tokens, visualRegions },
     journal,
     evidence: {
       nativeTransport: permissions.state === 'reported' ? 'permission_status_query_only' : 'unverified',
@@ -332,6 +416,7 @@ export async function doctor({ host, paths, binary = 'cua-driver' } = {}) {
       cleanup: 'not_tested',
       standardModeRun: 'not_tested',
       directCapture: 'not_tested',
+      visualRegions: 'not_tested',
       judge: 'not_called',
       liveJudgeCredentials: 'not_verified',
     },
@@ -342,6 +427,7 @@ export async function doctor({ host, paths, binary = 'cua-driver' } = {}) {
       'Browser delivery, application completion, and owned-resource cleanup require a separately authorized native fixture run.',
       'The capture-bound pixel capability reflects the click schema declared by cua-driver describe click, not a delivered click. Journal entries are valid on-disk records; Doctor does not ask the daemon whether those sessions are live.',
       'Publishing remains blocked until an actual clean-machine standard-mode run. A fresh HOME on a configured machine is insufficient.',
+      'Visual regions reflect the declared parse_visual_regions schema and cua-perception extension status only; extension status is not parse proof. Doctor never runs the perception worker, its self-test, a capture, or a parse.',
     ],
   };
 }

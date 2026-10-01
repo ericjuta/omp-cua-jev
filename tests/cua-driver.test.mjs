@@ -11,15 +11,19 @@ import { JOURNAL_SCHEMA, readEntry, updateEntry, writeEntry } from '../src/journ
 const journalModule = new URL('../src/journal.mjs', import.meta.url).href;
 
 // Every fixture journals into its own temporary directory, never the user's state directory.
+// A step's delayMs sleeps after its dispatch is logged; childEvents() then reports that child's
+// pid, any catchable signal it received, and whether its sleep finished.
 async function createFixture(t, session, steps, statuses = []) {
   const directory = await mkdtemp(join(tmpdir(), 'omp-cua-jev-driver-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const executable = join(directory, 'driver.mjs');
   const log = join(directory, 'dispatch.json');
   const statusLog = join(directory, 'status.json');
+  const childLog = join(directory, 'child.json');
   const journalDir = join(directory, 'journal');
   await writeFile(log, '[]', { mode: 0o600 });
   await writeFile(statusLog, '0', { mode: 0o600 });
+  await writeFile(childLog, '[]', { mode: 0o600 });
   await writeFile(executable, `#!${process.execPath}
 import { readFileSync, writeFileSync } from 'node:fs';
 const log = ${JSON.stringify(log)};
@@ -51,6 +55,18 @@ if (step?.journal) {
 dispatches.push(dispatch);
 writeFileSync(log, JSON.stringify(dispatches));
 if (command !== 'call' || !step || tool !== step.tool) throw new Error('Unexpected fixture dispatch.');
+if (step.delayMs !== undefined) {
+  // After the dispatch log write, so a killed child still counts as dispatched. Catchable kill
+  // signals are recorded and ignored, so only SIGKILL can end this bounded sleep early.
+  const childLog = ${JSON.stringify(childLog)};
+  const record = event => writeFileSync(childLog, JSON.stringify([...JSON.parse(readFileSync(childLog, 'utf8')), event]));
+  const handlers = ['SIGTERM', 'SIGINT', 'SIGHUP'].map(signal => [signal, () => record({ signal })]);
+  for (const [signal, handler] of handlers) process.on(signal, handler);
+  record({ pid: process.pid });
+  await new Promise(resolve => setTimeout(resolve, step.delayMs));
+  for (const [signal, handler] of handlers) process.off(signal, handler);
+  record({ slept: step.delayMs });
+}
 process.stdout.write(step.stdout ?? JSON.stringify(step.receipt));
 if (step.stderr !== undefined) process.stderr.write(step.stderr);
 process.exitCode = step.exitCode ?? 0;
@@ -63,6 +79,7 @@ process.exitCode = step.exitCode ?? 0;
     driver: createCuaDriver({ binary: executable, session, journalDir }),
     dispatches: async () => JSON.parse(await readFile(log, 'utf8')),
     statusProbes: async () => JSON.parse(await readFile(statusLog, 'utf8')),
+    childEvents: async () => JSON.parse(await readFile(childLog, 'utf8')),
   };
 }
 
@@ -895,6 +912,260 @@ test('native refusal envelopes name the tool and expose only allowlisted codes w
   assert.deepEqual(await dispatches(), [
     { command: 'call', tool: 'start_session', args: { session } },
     ...cases.map(() => ({ command: 'call', tool: 'click', args: { ...request, session } })),
+    { command: 'call', tool: 'end_session', args: { session } },
+  ]);
+});
+
+// Mutation targets: drop a perception or Driver 0.31.0 code or hint, take hints from native text, or relax a safe hint.
+test('perception and Driver 0.31.0 refusal codes expose static, conservative hints from root or nested envelopes', async t => {
+  const session = 'owned-perception-refusals';
+  const secret = 'private-sentinel Bearer token https://private.invalid';
+  const parse = {
+    capture_id: 'capture_owned_0000000000000007',
+    options: { kinds: ['text'], max_regions: 32, min_confidence: 0.5 },
+  };
+  const element = { pid: 65120, window_id: 15216, element_token: 'element_token_owned_0001' };
+  // Safety anchors only where the code settles the next step; every hint must also be static.
+  const fresh = /get_window_state.*THIS session/;
+  const operator = /operator/;
+  const stop = /Stop using the extension/;
+  const partial = /Do not act from a partial result; observe again before any bounded retry/;
+  const noRescale = /never rescale/;
+  const alreadyAuthorized = /only where already authorized/;
+  const cases = [
+    ...[
+      ['not_installed', operator, /tasks never install/],
+      ['capture_not_found', fresh],
+      ['capture_expired', fresh],
+      ['capture_stale', fresh],
+      ['capture_generation_mismatch', fresh],
+      ['unsupported_target', alreadyAuthorized],
+      ['unsupported_platform', alreadyAuthorized],
+      ['incompatible_protocol', operator, stop],
+      ['artifact_invalid', operator, stop],
+      ['invalid_frame', noRescale],
+      ['resource_limit_exceeded', noRescale],
+      ['worker_launch_failed', partial],
+      ['worker_crashed', partial],
+      ['worker_cancelled', partial],
+      ['timeout', /outcome is unknown/, partial, /Never replay a mutation/],
+      ['inference_failed', partial],
+    ].map(([code, ...hints]) => ({ code, hints, tool: 'parse_visual_regions', args: parse })),
+    ...[
+      ['invalid_arguments', /do not resend/],
+      ['stale_element_token', fresh, /do not replay/],
+    ].map(([code, ...hints]) => ({ code, hints, tool: 'click', args: element })),
+  ];
+  // Each code arrives twice with different native text: in cua-perception's root
+  // {code, message, retryable} envelope and in the nested {refusal:{code, message}} shape
+  // that Driver 0.31.0 uses for element-token codes.
+  const { driver, dispatches } = await createFixture(t, session, [
+    { tool: 'start_session', receipt: { session, active: true } },
+    ...cases.flatMap(({ code, tool }) => [
+      { tool, receipt: { code, message: secret, retryable: false }, exitCode: 1, stderr: secret },
+      {
+        tool, exitCode: 1,
+        receipt: { refusal: { code, message: 'private-sentinel other', hint: 'private-sentinel native hint' }, retryable: true },
+      },
+    ]),
+    { tool: 'end_session', receipt: { session, active: false } },
+  ]);
+  await driver.start();
+  for (const { code, hints, tool, args } of cases) {
+    const received = [];
+    for (const envelope of ['root', 'nested']) {
+      await assert.rejects(driver.call(tool, args), error => {
+        assertPrivateFailure(error, { refusalCode: code, exitCode: 1, hint: true });
+        assert.equal(error.tool, tool);
+        assert.equal(error.message, `Cua Driver ${tool} request refused: ${code}.`);
+        received.push(error.hint);
+        return true;
+      }, `${code} ${envelope}`);
+    }
+    // Static: the code alone selects the hint, whatever the envelope or native text.
+    assert.equal(received[1], received[0], code);
+    for (const pattern of hints) assert.match(received[0], pattern, code);
+  }
+  await driver.end();
+  assert.deepEqual(await dispatches(), [
+    { command: 'call', tool: 'start_session', args: { session } },
+    ...cases.flatMap(({ tool, args }) => [
+      { command: 'call', tool, args: { ...args, session } },
+      { command: 'call', tool, args: { ...args, session } },
+    ]),
+    { command: 'call', tool: 'end_session', args: { session } },
+  ]);
+});
+
+// Mutation targets: expose unknown or removed codes, read a code from stderr or partial JSON, or accept non-record output.
+test('unknown, removed, and malformed refusal output stays private without a code or hint', async t => {
+  const session = 'owned-private-envelopes';
+  const secret = 'private-sentinel Bearer token https://private.invalid';
+  const parse = { capture_id: 'capture_owned_0000000000000008' };
+  const element = { pid: 65120, window_id: 15216, element_token: 'element_token_owned_0002' };
+  const cases = [
+    {
+      name: 'unknown root code', tool: 'parse_visual_regions', exitCode: 1,
+      receipt: { code: 'private-sentinel-perception', message: secret, retryable: false },
+    },
+    // Driver 0.31.0 rejects element_index/snapshot_id outright, so their former codes are not allowlisted.
+    {
+      name: 'removed snapshot code', tool: 'click', exitCode: 1,
+      receipt: { code: 'snapshot_id_required', effect: 'refused', message: secret },
+    },
+    {
+      name: 'removed element index code', tool: 'click', exitCode: 1,
+      receipt: { refusal: { code: 'element_index_required', message: secret } },
+    },
+    { name: 'non-string code', tool: 'parse_visual_regions', receipt: { code: ['not_installed'], message: secret }, exitCode: 1 },
+    { name: 'array envelope', tool: 'parse_visual_regions', stdout: '[{"code":"not_installed"}]', exitCode: 1 },
+    { name: 'truncated envelope', tool: 'parse_visual_regions', stdout: `{"code":"not_installed","message":"${secret}`, exitCode: 1 },
+    { name: 'trailing output', tool: 'parse_visual_regions', stdout: `{"code":"not_installed"} ${secret}`, exitCode: 1 },
+    { name: 'empty output', tool: 'parse_visual_regions', stdout: '', exitCode: 1 },
+    { name: 'zero-exit non-record', tool: 'parse_visual_regions', stdout: 'null' },
+  ];
+  const { driver, dispatches } = await createFixture(t, session, [
+    { tool: 'start_session', receipt: { session, active: true } },
+    // stderr always names an allowlisted code; only a fully parsed stdout envelope may.
+    ...cases.map(({ tool, receipt, stdout, exitCode }) => ({
+      tool, receipt, stdout, exitCode, stderr: JSON.stringify({ code: 'not_installed', message: secret }),
+    })),
+    { tool: 'end_session', receipt: { session, active: false } },
+  ]);
+  await driver.start();
+  for (const { name, tool, exitCode } of cases) {
+    await assert.rejects(driver.call(tool, tool === 'click' ? element : parse), error => {
+      assertPrivateFailure(error, { exitCode });
+      assert.equal(error.tool, tool);
+      assert.equal(error.message, `Cua Driver ${tool} request failed.`);
+      return true;
+    }, name);
+  }
+  await driver.end();
+  assert.deepEqual(await dispatches(), [
+    { command: 'call', tool: 'start_session', args: { session } },
+    ...cases.map(({ tool }) => ({ command: 'call', tool, args: { ...(tool === 'click' ? element : parse), session } })),
+    { command: 'call', tool: 'end_session', args: { session } },
+  ]);
+});
+
+// Mutation targets: dispatch install_extension, let arguments or options bypass the reservation, or spend the session.
+test('install_extension is refused locally for the operator while the active session stays usable', async t => {
+  const session = 'owned-install-reserved';
+  const { driver, dispatches } = await createFixture(t, session, [
+    { tool: 'start_session', receipt: { session, active: true } },
+    { tool: 'set_value', receipt: { status: 'ok' } },
+    { tool: 'end_session', receipt: { session, active: false } },
+  ]);
+  await driver.start();
+  const started = [{ command: 'call', tool: 'start_session', args: { session } }];
+  for (const operation of [
+    () => driver.call('install_extension', { name: 'perception' }),
+    () => driver.call('install_extension', { name: 'perception', catalog: '/tmp/private-sentinel.catalog.json' }),
+    () => driver.call('install_extension', { name: 'perception' }, { timeoutMs: 1_000 }),
+    () => driver.call('install_extension'),
+  ]) {
+    await assert.rejects(operation(), error => {
+      assertPrivateFailure(error, { hint: true, unknownOutcome: false });
+      assert.equal(error.tool, 'install_extension');
+      assert.equal(error.message, 'Cua Driver install_extension request failed.');
+      assert.match(error.hint, /operator-only/);
+      assert.match(error.hint, /Never install from a task or chooser/);
+      return true;
+    });
+    assert.deepEqual(await dispatches(), started);
+  }
+  assert.deepEqual(await driver.call('set_value', { value: 'after-install-refusal' }), { status: 'ok' });
+  await driver.end();
+  assert.deepEqual(await dispatches(), [
+    ...started,
+    { command: 'call', tool: 'set_value', args: { value: 'after-install-refusal', session } },
+    { command: 'call', tool: 'end_session', args: { session } },
+  ]);
+});
+
+// Mutation targets: accept widened, inherited, accessor, proxy, or non-plain options, run a getter, or refuse explicit undefined.
+test('call options are exactly an own plain timeoutMs record and fail locally otherwise', async t => {
+  const session = 'owned-call-options';
+  const ok = { status: 'ok' };
+  // Explicit undefined is omission; null-prototype and cross-realm records are plain; the bound is inclusive.
+  const accepted = [
+    undefined,
+    { timeoutMs: 2 ** 31 - 1 },
+    Object.assign(Object.create(null), { timeoutMs: 20_000 }),
+    runInNewContext('({ timeoutMs: 20000 })'),
+  ];
+  const { driver, dispatches } = await createFixture(t, session, [
+    { tool: 'start_session', receipt: { session, active: true } },
+    ...accepted.map(() => ({ tool: 'set_value', receipt: ok })),
+    { tool: 'end_session', receipt: { session, active: false } },
+  ]);
+  await driver.start();
+  const started = [{ command: 'call', tool: 'start_session', args: { session } }];
+  let reads = 0;
+  for (const options of [
+    null, [], 1_000, '1000', true,
+    {}, { timeout: 1_000 },
+    { timeoutMs: 1_000, extra: true }, { timeoutMs: 1_000, session },
+    { timeoutMs: 1_000, [Symbol('extra')]: true },
+    Object.defineProperty({ timeoutMs: 1_000 }, 'extra', { value: true }),
+    Object.defineProperty({}, 'timeoutMs', { value: 1_000 }),
+    { get timeoutMs() { reads += 1; return 1_000; } },
+    new Proxy({ timeoutMs: 1_000 }, {}),
+    Object.create({ timeoutMs: 1_000 }),
+    new (class Options { constructor() { this.timeoutMs = 1_000; } })(),
+    Object.assign([], { timeoutMs: 1_000 }),
+    ...[undefined, null, '1000', true, 1_000n, 0, -1, 1.5, 2 ** 31, Number.NaN, Infinity].map(timeoutMs => ({ timeoutMs })),
+  ]) {
+    await rejectsWithoutDispatch(driver.call('set_value', { value: 'blocked' }, options), dispatches, started);
+  }
+  // Validation reads descriptors only; the getter never runs.
+  assert.equal(reads, 0);
+  for (const [index, options] of accepted.entries()) {
+    assert.deepEqual(await driver.call('set_value', { value: `accepted-${index}` }, options), ok);
+  }
+  await driver.end();
+  assert.deepEqual(await dispatches(), [
+    ...started,
+    ...accepted.map((_, index) => ({ command: 'call', tool: 'set_value', args: { value: `accepted-${index}`, session } })),
+    { command: 'call', tool: 'end_session', args: { session } },
+  ]);
+});
+
+// Mutation targets: ignore or keep the per-call timeout, kill with a catchable signal, or leave the child running.
+test('a call-local timeout SIGKILLs only its sleeping child and the next call keeps the instance default', { timeout: 30_000 }, async t => {
+  const session = 'owned-call-timeout';
+  const request = { capture_id: 'capture_owned_0000000000000009', options: { kinds: ['text'] } };
+  const visual = { schema: 'cua.visual_regions_v1', regions: [] };
+  const { binary, journalDir, dispatches, childEvents } = await createFixture(t, session, [
+    { tool: 'start_session', receipt: { session, active: true } },
+    // Margins, not thresholds: the 1.5 s override leaves room for child startup and logging; this
+    // child would answer after 5 s, inside the 10 s default, if the override were ignored; the next
+    // one outlives that override by 1.5 s yet ends 7 s inside the default.
+    { tool: 'parse_visual_regions', receipt: visual, delayMs: 5_000 },
+    { tool: 'parse_visual_regions', receipt: visual, delayMs: 3_000 },
+    { tool: 'end_session', receipt: { session, active: false } },
+  ]);
+  const driver = createCuaDriver({ binary, session, journalDir, timeoutMs: 10_000 });
+  await driver.start();
+  await assert.rejects(driver.call('parse_visual_regions', request, { timeoutMs: 1_500 }), error => {
+    // A killed child leaves no exit code, receipt, or refusal; its native outcome stays unknown.
+    assertPrivateFailure(error);
+    assert.equal(error.tool, 'parse_visual_regions');
+    return true;
+  });
+  const [started, ...afterStart] = await childEvents();
+  // The child logged its dispatch and began sleeping. No catchable signal arrived, the sleep never
+  // finished, and the process is gone: only SIGKILL ends a child that way.
+  assert.deepEqual(afterStart, []);
+  assert.throws(() => process.kill(started.pid, 0), { code: 'ESRCH' });
+  assert.deepEqual(await driver.call('parse_visual_regions', request), visual);
+  assert.deepEqual((await childEvents()).slice(2), [{ slept: 3_000 }]);
+  await driver.end();
+  assert.deepEqual(await dispatches(), [
+    { command: 'call', tool: 'start_session', args: { session } },
+    { command: 'call', tool: 'parse_visual_regions', args: { ...request, session } },
+    { command: 'call', tool: 'parse_visual_regions', args: { ...request, session } },
     { command: 'call', tool: 'end_session', args: { session } },
   ]);
 });

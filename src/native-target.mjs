@@ -7,6 +7,7 @@ import { isProxy } from 'node:util/types';
 import { createCuaDriver } from './cua-driver.mjs';
 import { journalDirectory, ownedCaptureDirectory, readEntry } from './journal.mjs';
 import { decodePng, findRegions } from './pixels.mjs';
+import { projectParse } from './visual.mjs';
 
 const positiveInteger = value => Number.isSafeInteger(value) && value > 0;
 const own = (value, key) => Object.hasOwn(value, key);
@@ -14,13 +15,21 @@ const ELEMENT_FIELDS = ['element_index', 'role', 'label', 'value', 'value_descri
   'min', 'max', 'enabled', 'selected', 'actions', 'in_web_content', 'parent_index', 'depth'];
 const LOCAL_ELEMENT_FIELDS = [...ELEMENT_FIELDS, 'element_token', 'frame'];
 const OBSERVE_FIELDS = new Set(['screenshot', 'webContentOnly', 'include_accessibility_tree',
-  'query', 'max_elements', 'max_depth', 'max_dimension']);
+  'query', 'max_elements', 'max_depth', 'max_dimension', 'max_image_dimension']);
+// Driver 0.31 element actions accept only element_token; element_index is display-only.
 const ACTION_FIELDS = {
-  click: new Set(['element_token', 'element_index', 'snapshot_id', 'x', 'y', 'button', 'count', 'capture_id']),
-  set_value: new Set(['element_token', 'element_index', 'snapshot_id', 'value']),
-  type_text: new Set(['text', 'element_token', 'element_index', 'snapshot_id']),
-  press_key: new Set(['key', 'element_token', 'element_index', 'snapshot_id']),
+  click: new Set(['element_token', 'x', 'y', 'button', 'count', 'capture_id']),
+  set_value: new Set(['element_token', 'value']),
+  type_text: new Set(['text', 'element_token']),
+  press_key: new Set(['key', 'element_token']),
 };
+const VISUAL_FIELDS = new Set(['kinds', 'maxRegions', 'minConfidence']);
+const VISUAL_KINDS = new Set(['text', 'icon']);
+// visualRegions() result: projectParse output without its source binding.
+const VISUAL_RESULT_FIELDS = ['capture_id', 'width', 'height', 'sha256', 'actionCoordinateSpace',
+  'parser', 'regions', 'warnings', 'durationMs'];
+// Driver budgets: 15 s cold worker startup plus 30 s inference.
+const PARSE_TIMEOUT_MS = 45_000;
 const VERIFY_FIELDS = new Set(['expect', 'timeoutMs', 'stableSamples']);
 const VERIFY_STATUSES = new Set(['satisfied', 'unsatisfied', 'unknown']);
 // Native reason codes only; free-form native text is never returned.
@@ -35,6 +44,14 @@ function requireThat(condition, message, unknownOutcome = false, reason) {
 async function ownedFile(operation) {
   try { return await operation(); }
   catch { requireThat(false, 'Owned capture file operation failed.'); }
+}
+// Re-read an owned capture; its recorded byte_length and sha256 must still match.
+async function ownedBytes(image) {
+  requireThat(await ownedFile(() => realpath(image.file_path)) === image.file_path, 'Capture is not the owned file.');
+  const bytes = await ownedFile(() => readFile(image.file_path));
+  requireThat(bytes.length === image.byte_length &&
+    createHash('sha256').update(bytes).digest('hex') === image.sha256, 'Capture changed after observation.');
+  return bytes;
 }
 // Every bound within one point of the capture's window_bounds.
 function sameBounds(bounds, expected) {
@@ -53,13 +70,14 @@ function containsBounds(outer, inner) {
     outer.x <= inner.x && outer.y <= inner.y &&
     outer.x + outer.width >= inner.x + inner.width && outer.y + outer.height >= inner.y + inner.height;
 }
-// Guard reads dispatch no action. Keep only the driver's validated tool name and allowlisted refusal code.
-async function guardRead(read, unknownOutcome = false, reason = 'guard_unavailable') {
+// Guard and parse reads dispatch no action. Keep only the driver's validated tool name and allowlisted refusal code.
+async function guardRead(read, unknownOutcome = false, reason = 'guard_unavailable',
+  message = 'Pixel guard evidence is unavailable.') {
   try { return await read(); }
   catch (error) {
     const driverError = error?.code === 'CUA_DRIVER_ERROR';
     const safe = key => driverError && typeof error[key] === 'string' && REASON_CODE.test(error[key]) ? { [key]: error[key] } : {};
-    throw Object.assign(new Error('Native target: Pixel guard evidence is unavailable.'), {
+    throw Object.assign(new Error(`Native target: ${message}`), {
       code: 'NATIVE_TARGET_ERROR', unknownOutcome, reason, ...safe('tool'), ...safe('refusalCode'),
     });
   }
@@ -96,14 +114,33 @@ function observationOptions(options) {
   record(options);
   requireThat(Object.keys(options).every(key => OBSERVE_FIELDS.has(key)), 'Unknown observation option.');
   const { screenshot = false, webContentOnly = true, include_accessibility_tree = true,
-    max_elements = 2000, max_depth = 25, max_dimension, query } = options;
+    max_elements = 2000, max_depth = 25, max_dimension, max_image_dimension, query } = options;
   requireThat([screenshot, webContentOnly, include_accessibility_tree].every(value => typeof value === 'boolean') &&
     (screenshot || include_accessibility_tree), 'Invalid observation mode.');
   requireThat(positiveInteger(max_elements) && max_elements <= 2000 && positiveInteger(max_depth) && max_depth <= 25 &&
     (max_dimension === undefined || positiveInteger(max_dimension)) &&
+    (max_image_dimension === undefined || (Number.isSafeInteger(max_image_dimension) && max_image_dimension >= 0)) &&
     (query === undefined || typeof query === 'string'), 'Invalid bounded AX options.');
   return { screenshot, webContentOnly, args: { include_accessibility_tree, include_screenshot: false,
-    max_elements, max_depth, ...pick(options, ['max_dimension', 'query']) } };
+    max_elements, max_depth, ...pick(options, ['max_dimension', 'max_image_dimension', 'query']) } };
+}
+// Caller visual options map to the native parse options; absent keys stay absent.
+function visualOptions(options) {
+  record(options);
+  requireThat(Object.keys(options).every(key => VISUAL_FIELDS.has(key)), 'Unknown visual regions option.');
+  const { kinds, maxRegions, minConfidence } = options;
+  // One read of the caller's array; only the validated copy is sent.
+  const list = Array.isArray(kinds) && !isProxy(kinds) ? Array.from(kinds) : null;
+  requireThat((kinds === undefined || (list !== null && list.length > 0 &&
+    list.every(kind => VISUAL_KINDS.has(kind)) && new Set(list).size === list.length)) &&
+    (maxRegions === undefined || positiveInteger(maxRegions)) &&
+    (minConfidence === undefined || (Number.isFinite(minConfidence) && minConfidence >= 0 && minConfidence <= 1)),
+  'Invalid visual regions options.');
+  return {
+    ...(kinds === undefined ? {} : { kinds: list }),
+    ...(maxRegions === undefined ? {} : { max_regions: maxRegions }),
+    ...(minConfidence === undefined ? {} : { min_confidence: minConfidence }),
+  };
 }
 function project(reply, webContentOnly) {
   requireThat(Array.isArray(reply.elements), 'Missing native elements.');
@@ -142,7 +179,7 @@ function geometry(screenshot) {
  * try/finally surfaces the resume error. If the driver adopted the session but a
  * later local resume step failed, end() closes it like any started session.
  * Driver and pixel decoder errors pass through unchanged, except pixel guard
- * reads (below).
+ * and visual parse reads (below).
  *
  * start() authorizes observation only after the driver session starts and the
  * exact {pid,windowId} target is recorded via driver.recordOwnership. resume()
@@ -154,12 +191,15 @@ function geometry(screenshot) {
  * with the target before any capture dispatches.
  *
  * observe({screenshot=false,webContentOnly=true,include_accessibility_tree=true,
- * max_elements=2000,max_depth=25,query?,max_dimension?}) returns frozen plain JSON
+ * max_elements=2000,max_depth=25,query?,max_dimension?,max_image_dimension?})
+ * returns frozen plain JSON
  * {id,observedAt,state,local}. state holds compact AX fields and coverage, with
  * unknown completeness/truncation as null. local retains exact pid/window_id,
  * snapshot_id when present, elements with element_token/frame, and screenshot
  * {file_path,capture_id,width,height,scale,window_bounds,frame_valid,byte_length,
  * sha256}. capture_id is the native single-use capture binding string or null.
+ * max_image_dimension (integer >=0; 0 = native resolution) overrides the Driver's
+ * configured long-edge downscale; max_dimension stays a tighter cap.
  * The file holds original captured bytes until end. AX frames are desktop
  * coordinates, NOT screenshot pixels. Never derive pixel candidates from them.
  *
@@ -176,7 +216,9 @@ function geometry(screenshot) {
  *
  * execute({action:{tool,args}}, observation) supports native click, set_value,
  * type_text, press_key. It supplies exact pid/window_id; mismatched scope is
- * rejected. AX targets require a current token or exact snapshot_id/index pair.
+ * rejected. AX targets require a current element_token (Driver 0.31 rejects
+ * element_index/snapshot_id, so they are refused locally); element_index stays
+ * display-only state.
  * Pixel x/y use returned PNG pixels unchanged, never multiplied by scale.
  * delivery_mode defaults background; foreground requires explicit opt-in here
  * AND in the candidate. set_value has no delivery_mode argument. AX clicks are
@@ -232,6 +274,25 @@ function geometry(screenshot) {
  * width/height, and returns frozen pixels.findRegions {regions,truncated} plus
  * {capture_id,width,height}. It neither invalidates evidence nor authorizes an
  * action; anchors are capture pixels for that same observation.
+ *
+ * visualRegions(observation, {kinds?,maxRegions?,minConfidence?}) requires the
+ * current observation with a native capture_id (kinds a non-empty unique subset
+ * of text/icon; maxRegions positive integer; minConfidence 0-1). It re-hashes
+ * the owned capture like regions(), then sends read-only parse_visual_regions
+ * (optional cua-perception extension) with a 45 s client timeout. The receipt
+ * must project via visual.projectParse and bind to this capture: capture_id,
+ * window pid/window_id, width/height and sha256. Returns frozen {capture_id,
+ * width,height,sha256,actionCoordinateSpace,parser,regions,warnings,durationMs};
+ * region bounds/anchors are PNG pixels of that capture, the same space as
+ * regions() and pixel clicks. actionCoordinateSpace (screenshot_pixels or the
+ * Driver's affine for downscaled captures) is evidence only and never applied:
+ * the Driver maps capture-bound click pixels itself. Parsing does not consume
+ * the capture or invalidate the observation; a settled observation keeps its
+ * pixel authority, and OCR text authorizes nothing. Parses take ~4-6 s, which
+ * counts against maxAgeMs. Driver failures throw NATIVE_TARGET_ERROR
+ * unknownOutcome:false reason visual_regions_unavailable, keeping only the
+ * driver's tool and refusalCode; malformed or mismatched receipts throw
+ * unknownOutcome:false.
  */
 export function createNativeTarget(options = {}) {
   record(options);
@@ -341,19 +402,16 @@ export function createNativeTarget(options = {}) {
         (!own(args, 'pid') || args.pid === pid) && (!own(args, 'window_id') || args.window_id === windowId), 'Mismatched action scope or unsupported arguments.');
       const mode = args.delivery_mode ?? 'background';
       requireThat(mode === 'background' || (mode === 'foreground' && foreground), 'Foreground delivery is not enabled.');
-      const hasElement = ['element_token', 'element_index', 'snapshot_id'].some(key => own(args, key));
+      const hasElement = own(args, 'element_token');
       const pixels = own(args, 'x') || own(args, 'y');
       const pixelClick = tool === 'click' && !hasElement;
       const image = observation.local.screenshot;
       if (hasElement) {
         requireThat(!pixels && !own(args, 'capture_id'), 'Mixed AX and pixel addressing.');
-        const matches = observation.local.elements.filter(element =>
-          (own(args, 'element_token') ? typeof args.element_token === 'string' && element.element_token === args.element_token
-            : own(args, 'snapshot_id') && args.snapshot_id === observation.local.snapshot_id &&
-              Number.isSafeInteger(args.element_index) && element.element_index === args.element_index));
-        requireThat(matches.length === 1 && matches[0].enabled !== false &&
-          (!own(args, 'element_index') || args.element_index === matches[0].element_index) &&
-          (!own(args, 'snapshot_id') || args.snapshot_id === observation.local.snapshot_id), 'AX identity is not current.');
+        const token = args.element_token;
+        const matches = typeof token === 'string'
+          ? observation.local.elements.filter(element => element.element_token === token) : [];
+        requireThat(matches.length === 1 && matches[0].enabled !== false, 'AX identity is not current.');
         if (tool === 'click') requireThat(mode === 'background' && (args.button ?? 'left') === 'left' &&
           (args.count ?? 1) === 1 && Array.isArray(matches[0].actions) &&
           matches[0].actions.includes('AXPress'), 'AX click requires advertised AXPress.');
@@ -476,15 +534,34 @@ export function createNativeTarget(options = {}) {
     const image = observation.local.screenshot;
     requireThat(image !== undefined, 'Observation has no owned capture.');
     record(options);
-    requireThat(await ownedFile(() => realpath(image.file_path)) === image.file_path, 'Capture is not the owned file.');
-    const bytes = await ownedFile(() => readFile(image.file_path));
-    requireThat(bytes.length === image.byte_length &&
-      createHash('sha256').update(bytes).digest('hex') === image.sha256, 'Capture changed after observation.');
     // Decode the hashed bytes themselves; the file is never read again.
-    const decoded = decodePng(bytes);
+    const decoded = decodePng(await ownedBytes(image));
     requireThat(decoded.width === image.width && decoded.height === image.height, 'Capture dimensions do not match.');
     return freeze({ ...findRegions(decoded, options), capture_id: image.capture_id,
       width: decoded.width, height: decoded.height });
+  }
+  async function visualRegions(observation, options = {}) {
+    requireThat(active && current !== null && current.observation === observation && current.generation === generation,
+      'Observation is stale or foreign.');
+    const image = observation.local.screenshot;
+    requireThat(image !== undefined && typeof image.capture_id === 'string' &&
+      positiveInteger(image.width) && positiveInteger(image.height), 'Observation has no native capture.');
+    const parseOptions = visualOptions(options);
+    const request = { capture_id: image.capture_id };
+    if (Object.keys(parseOptions).length > 0) request.options = parseOptions;
+    await ownedBytes(image);
+    const reply = await guardRead(() => driver.call('parse_visual_regions', request, { timeoutMs: PARSE_TIMEOUT_MS }),
+      false, 'visual_regions_unavailable', 'Visual regions are unavailable.');
+    let visual;
+    // The receipt is untrusted; projectParse detail is not surfaced.
+    try { visual = projectParse(reply); }
+    catch { requireThat(false, 'Malformed visual regions receipt.'); }
+    requireThat(visual.capture_id === image.capture_id && visual.source?.kind === 'window' &&
+      visual.source.pid === pid && visual.source.window_id === windowId &&
+      visual.width === image.width && visual.height === image.height && visual.sha256 === image.sha256,
+    'Visual regions do not match the capture.');
+    // Bounds stay capture PNG pixels; the Driver applies any affine itself at click admission.
+    return freeze(pick(visual, VISUAL_RESULT_FIELDS));
   }
   return Object.freeze({
     session: driver.session, pid, windowId,
@@ -539,6 +616,7 @@ export function createNativeTarget(options = {}) {
     settle(options) { return operate(() => settle(options)); },
     verify(options) { return operate(() => verify(options)); },
     regions(observation, options) { return operate(() => regions(observation, options)); },
+    visualRegions(observation, options) { return operate(() => visualRegions(observation, options)); },
     execute(candidate, observation) { return operate(() => execute(candidate, observation)); },
   });
 }

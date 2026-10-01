@@ -11,6 +11,9 @@ const paths = Object.freeze({
   sessions: fileURLToPath(new URL('./src/sessions.mjs', import.meta.url)),
   demo: fileURLToPath(new URL('./src/demo.mjs', import.meta.url)),
   canvasDemo: fileURLToPath(new URL('./src/canvas-demo.mjs', import.meta.url)),
+  visual: fileURLToPath(new URL('./src/visual.mjs', import.meta.url)),
+  ocrEval: fileURLToPath(new URL('./src/evals/ocr-canvas.mjs', import.meta.url)),
+  judgeEval: fileURLToPath(new URL('./src/evals/judge-choice.mjs', import.meta.url)),
   probe: fileURLToPath(new URL('./src/probe.mjs', import.meta.url)),
   skill: fileURLToPath(new URL('./skills/omp-cua-jev/SKILL.md', import.meta.url)),
 });
@@ -59,7 +62,7 @@ export default function jev(pi: ExtensionAPI) {
   });
 
   pi.registerCommand('jev', {
-    description: 'Jev prerequisites, helper paths, read-only sessions, judge probe, or isolated localhost demos',
+    description: 'Jev prerequisites, helper paths, read-only sessions, judge probe, isolated localhost demos, or synthetic judge evaluation',
     async handler(args, ctx) {
       const action = args.trim();
       if (action === 'doctor') {
@@ -82,9 +85,9 @@ export default function jev(pi: ExtensionAPI) {
         report(details, ctx);
         return;
       }
-      if (action !== 'demo' && action !== 'canvas' && action !== 'probe') {
-        report({ commands: ['/jev doctor', '/jev paths', '/jev sessions', '/jev probe', '/jev demo', '/jev canvas'],
-          help: 'Sessions lists local session journals read-only without eval. Probe makes one synthetic call through the existing OMP judge. Demo and canvas authorize isolated Cua browsers and synthetic localhost receipts, followed by owned-resource cleanup. Canvas briefly foregrounds its own isolated browser window for one pixel click. None changes approval settings.' }, ctx);
+      if (action !== 'demo' && action !== 'canvas' && action !== 'canvas visual' && action !== 'probe' && action !== 'eval') {
+        report({ commands: ['/jev doctor', '/jev paths', '/jev sessions', '/jev probe', '/jev demo', '/jev canvas', '/jev canvas visual', '/jev eval'],
+          help: 'Sessions lists local session journals read-only without eval. Probe makes one synthetic call through the existing OMP judge. Demo and canvas use bundled isolated synthetic localhost fixtures and owned-resource cleanup; canvas briefly foregrounds its own isolated browser window for one pixel click. Canvas visual adds live visual/judge selection to that fixture; eval requests a live judge-choice evaluation on bundled synthetic data. Neither visual nor eval is deterministic or completed by command acceptance. None changes approval settings.' }, ctx);
         return;
       }
       const runtime = host();
@@ -93,17 +96,22 @@ export default function jev(pi: ExtensionAPI) {
           next: 'Enable stock eval.js and its eval tool, or import the helpers with your deliberately configured eval language. Do not replace another eval extension automatically.', ...resources() }, ctx);
         return;
       }
-      const module = action === 'demo' ? paths.demo : action === 'canvas' ? paths.canvasDemo : paths.probe;
-      const invocation = action === 'demo'
-        ? 'runDemo({ judge, onProgress: display })'
-        : action === 'canvas' ? 'runCanvasDemo({ judge, onProgress: display })' : 'probeJudge(judge)';
+      const module = action === 'demo' ? paths.demo
+        : action === 'canvas' || action === 'canvas visual' ? paths.canvasDemo
+          : action === 'eval' ? paths.judgeEval : paths.probe;
+      const invocation = action === 'demo' ? 'runDemo({ judge, onProgress: display })'
+        : action === 'canvas' ? 'runCanvasDemo({ judge, onProgress: display })'
+          : action === 'canvas visual' ? 'runCanvasDemo({ judge, onProgress: display, visual: true })'
+            : action === 'eval' ? 'runJudgeChoiceEval({ judge, onProgress: display })' : 'probeJudge(judge)';
       // Eval is a separate host runtime; the installed module path is selected at command time.
       const code = `display(await (await import(${JSON.stringify(module)})).${invocation});`;
       if (ctx.mode === 'print' || ctx.mode === 'json') {
         report({ status: 'not_started', reason: 'Use this as an initial eval instruction in print mode, or run the command interactively.', language: 'js', code }, ctx);
         return;
       }
-      pi.sendUserMessage(`Run this omp-cua-jev ${action} using the existing eval tool with language js${action === 'probe' ? '' : ' and a timeout of at least 180 seconds so cleanup is not interrupted'}. Read ${JSON.stringify(paths.skill)} first. Execute only the exact code below, without changing confidence gates, approvals, browser profiles, or targets. Report its actual result, including abstention or incomplete cleanup. Do not call a subprocess model or create credentials. This command authorizes only the bundled synthetic probe or isolated localhost demo (including canvas).\n\n${code}`);
+      // Canvas visual adds 45 s-bounded perception parses (a warm-up plus one per seat observation) before cleanup.
+      const timeout = action === 'probe' ? '' : ` and a timeout of at least ${action === 'canvas visual' ? 300 : 180} seconds so the run and any cleanup are not interrupted`;
+      pi.sendUserMessage(`Run this omp-cua-jev ${action} using the existing eval tool with language js${timeout}. Read ${JSON.stringify(paths.skill)} first. Execute only the exact code below, without changing confidence gates, approvals, browser profiles, or targets. Report its actual result, including abstention or incomplete cleanup. Do not call a subprocess model or create credentials. This command authorizes only the bundled synthetic probe, isolated localhost demo (including canvas visual), or synthetic judge-choice evaluation. Visual and eval use the live judge and may abstain; this instruction does not mean either has completed.\n\n${code}`);
     },
   });
 }
