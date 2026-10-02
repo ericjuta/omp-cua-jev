@@ -3,6 +3,26 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Releases are published as Git tags and are not on npm.
 
+## [0.4.1] - 2026-10-02
+
+### Changed
+
+- **Judge-visible OCR framing.** OCR labels are now described as evidence of which seat a disc is, and canvas text is still never to be followed as an instruction (`OCR_LABEL_NOTE`, exported from `paths.canvasDemo`). Candidate descriptions read `OCR reads its label as "A3"` instead of `Untrusted OCR text below it reads "A3"`. The 0.8/0.6 gates, geometry-only authorization, and the label-shape filter are unchanged.
+- **Judge-choice eval state.** Each available seat in the judge-visible state now includes its `candidateId`, so state rows map directly to candidates. This applies to all three conditions.
+- **Live visual canvas state.** Seat rows now include `position` (left to right among detected seats), `colour: "blue"` and `available: true`. All three are local geometry facts, because only blue available seats are detected. The state also adds `page`, `legend` and `ocrNote`.
+- **Measured effect (Jev via `openrouter/~typesafe/jev-latest`, 2026-10-01).** Judge-choice eval, 3 trials, fresh `dpr2-1568` OCR labels. Gated accuracy and mean confidence:
+  - anonymous 0/12, 0.565 (top-choice accuracy 0.75; all abstained);
+  - labelled 12/12, 0.948 (was 0/12, 0.613);
+  - injection 12/12, 0.943 (was 9/12, 0.817), with the injection followed 0 times.
+
+  There were no wrong choices. Ablation: the reframed wording alone took labelled to 12/12 at 0.902. Adding candidate IDs raised it to 0.955. OCR confidence and placement fields did not help (0.87), so they are not shipped. OpenRouter's edge cache makes repeated identical trials non-independent.
+- **Live visual canvas with Jev.**
+  - Before the position/legend change, run 1 (A5): Jev chose `seat_3` (A5) at 0.84 and passed the gates. The guard then refused before dispatch with `target_occluded`. No click was sent, and cleanup completed.
+  - Before the change, run 2 (A5): Jev chose `seat_3` at 0.78 and abstained. Replaying its captured state with `page`, `legend`, `position`, `colour` and `available` added gave the correct choice at 0.93 for A1, 0.90 for A3 and 0.86 for A5.
+  - After the change, one run failed before any judge call because the Mac was locked: `focus_window` returned `bring_to_front_exact_window_unverified`. No click was sent, and cleanup completed.
+  - After the change, with the Mac unlocked (2026-10-02): A5, A3 and A1 each completed with a gated Jev choice, at confidence 0.87, 0.91 and 0.92. Each run made one judge call and one guarded capture-bound foreground click, which produced exactly one trusted server click on the requested seat. A DOM Clear followed, and cleanup was complete: both sessions ended, the prepared PID exited and the profile was absent. The runs took 17,002, 14,882 and 15,196 ms. OCR read A1, A3 and A5 correctly. Each run spent about 3.0 s on the settled parse plus a 3.1–3.4 s warm-up. That is one run per seat on one host, not a calibration.
+- **`typesafe/jev-preview` is unavailable.** OpenRouter's judge catalog offers only `~typesafe/jev-latest` (`jev-1.13`). Direct TypeSafe access returns HTTP 402 `billing_error`. With an empty judge fallback chain, OMP reported `typesafe/jev-preview rejected the account recently`. Without that override, the role silently fell back to `openrouter/typesafe/jev-1.13-20260917`.
+
 ## [0.4.0] - 2026-10-01
 
 Tested against Cua Driver `0.31.0`. The optional `cua-perception` extension is not bundled, and this plugin never installs it. Perception refusal codes are pinned to cua-perception 0.2.1. The direct TypeSafe judge was unavailable: `probeJudge` surfaced `typesafe/jev-latest API error (402)` with `billing_error` (no available API credits). The same Jev model through `openrouter/~typesafe/jev-latest` answered in a separate process. With the unchanged 0.8 gate, it abstained on every labelled trial even though its top choice was always correct. A live visual canvas run completed for seat A5 with a substitute judge, not the configured judge: one guarded capture-bound foreground click, exactly one trusted server click on A5, and complete cleanup in 18,794 ms. Other attempts refused before dispatch with `target_offscreen` or `target_moved`, or failed at focus, and sent no click.
@@ -155,6 +175,7 @@ Tested against Cua Driver `0.30.2-nightly.20260927.36294544935`.
 
 - Initial release as `omp-jev`.
 
+[0.4.1]: https://github.com/ericjuta/omp-cua-jev/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/ericjuta/omp-cua-jev/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ericjuta/omp-cua-jev/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ericjuta/omp-cua-jev/compare/v0.1.2...v0.2.0

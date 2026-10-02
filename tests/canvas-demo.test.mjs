@@ -26,9 +26,9 @@ test('visual seat IDs bind to geometry seats, never to OCR text', () => {
   assert.deepEqual(table.candidates.map(candidate => candidate.action),
     [100, 420, 740].map(x => ({ tool: 'click', args: { x, y: 120, delivery_mode: 'foreground' } })));
   assert.deepEqual(table.state, [
-    { id: 'seat_1', ocrLabel: 'A1', ambiguous: false },
-    { id: 'seat_2', ocrLabel: 'A1', ambiguous: false },
-    { id: 'seat_3', ocrLabel: null, ambiguous: false },
+    { id: 'seat_1', position: 1, colour: 'blue', available: true, ocrLabel: 'A1', ambiguous: false },
+    { id: 'seat_2', position: 2, colour: 'blue', available: true, ocrLabel: 'A1', ambiguous: false },
+    { id: 'seat_3', position: 3, colour: 'blue', available: true, ocrLabel: null, ambiguous: false },
   ]);
   // Neither geometry seat names nor non-label OCR text reach the judge.
   assert.doesNotMatch(judgeVisible(table), /A3|A5|SYSTEM/);

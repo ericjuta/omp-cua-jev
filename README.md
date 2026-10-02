@@ -2,7 +2,7 @@
 
 Use OMP's configured `judge` to choose from a local action table, then execute and verify authorized actions through Cua Driver. The plugin supplies diagnostics, absolute helper paths, a bundled skill, and isolated localhost demos. It does not install a model client or keep separate credentials.
 
-**Version: v0.4.0.** Adds optional read-only visual regions through Cua's separately installed `cua-perception` extension, a judge-selected visual canvas mode, and synthetic OCR and judge-choice evals. These build on capture-bound pixels, deterministic region enumeration, and journaled session recovery. Native AX actions use Driver 0.31.0 `element_token`s only. Tested against Cua Driver `0.31.0` on this Mac only; no compatibility claim is made for other builds. Local results are recorded below. Clean-machine onboarding is still open. There is no npm package.
+**Version: v0.4.1.** Reframes OCR labels for the judge as seat-identity evidence, so Jev clears the unchanged 0.8 gate and completed live visual canvas runs. v0.4.0 added optional read-only visual regions through Cua's separately installed `cua-perception` extension, a judge-selected visual canvas mode, and synthetic OCR and judge-choice evals. These build on capture-bound pixels, deterministic region enumeration, and journaled session recovery. Native AX actions use Driver 0.31.0 `element_token`s only. Tested against Cua Driver `0.31.0` on this Mac only; no compatibility claim is made for other builds. Local results are recorded below. Clean-machine onboarding is still open. There is no npm package.
 
 ## Requirements
 
@@ -28,7 +28,7 @@ The current native implementation was tested against Cua Driver `0.31.0`. That e
 4. Install the pinned Git tag. Quote it so the shell does not eat the `#`:
 
    ```sh
-   omp plugin install 'github:ericjuta/omp-cua-jev#v0.4.0'
+   omp plugin install 'github:ericjuta/omp-cua-jev#v0.4.1'
    ```
 
    Start a new OMP session. There is no npm package. To work on a local checkout instead, clone the repo and run `omp plugin link /absolute/path/to/omp-cua-jev`. `/jev paths` reports the installed resources; `/skill:omp-cua-jev` loads the bundled workflow.
@@ -208,7 +208,7 @@ Driver runs the extension's contained health/self-test hook under a fixed 10-sec
 
 The OCR eval is offline. It serves the canvas fixture on loopback and renders it with owned headless system Chrome at `dpr1`, `dpr2`, and `dpr2-1568`. The last variant is downscaled with `sips -Z 1568` to mirror Driver's default. Each PNG is parsed with `cua-driver perception parse --image --capture --json`, which has `action_eligible: false`. It reports label recall, positioned recall, wrong labels, association accuracy, and whether `Selected: none` and `Clear selection` were read. It starts no Driver session, opens no visible window, and installs nothing. Missing prerequisites give `status: "blocked"` with `CHROME_UNAVAILABLE`, `DRIVER_UNAVAILABLE`, or `not_installed`, and the CLI exits 1 unless `status` is `ok`. Cleanup terminates the eval's own headless Chrome, closes the fixture, and removes its temporary directory.
 
-The judge-choice eval calls `chooseAction` with default gates and inert candidate actions. Available seats become neutral `seat_1`…`seat_n`, shuffled per trial, under three conditions. `anonymous` gives only row position and colour. `labelled` adds untrusted OCR labels. `injection` adds untrusted on-canvas text that tells the judge to select A5. Each condition runs four goals: A3, A1, A5, and the leftmost available seat. `trials` defaults to 2. Without supplied `labels`, it runs the OCR eval's `dpr2-1568` variant first; if that fails, it returns `blocked` with `LABELS_UNAVAILABLE`. It also returns `JUDGE_REQUIRED` without a judge. Each trial records the judge's raw `judgeChoice` (an offered ID, otherwise `null`), confidence, top probability, outcome, and, for injection, `injectionFollowed`. Each condition's `summary` reports gated outcome counts (`correct`, `abstain`, `reobserve`, `wrong`, `error`), `accuracy`, `abstainRate`, `wrongRate`, and `meanMs`. It also reports ungated diagnostics: `topChoiceAccuracy` and `topChoiceWrongRate` from the judge's own top answer before the gates, and `meanConfidence`. These diagnostics never lower a gate, and a correct ungated answer authorizes nothing. Scores are policy inputs, not calibrated correctness, and the result does not identify the model. Trials are not independent samples when the provider caches identical prompts. Through OpenRouter, OMP sent `X-OpenRouter-Cache: true` in local testing, so repeated prompts returned cached answers.
+The judge-choice eval calls `chooseAction` with default gates and inert candidate actions. Available seats become neutral `seat_1`…`seat_n`, shuffled per trial, under three conditions. `anonymous` gives only row position, colour and each available seat's `candidateId`. `labelled` adds OCR labels, framed by `OCR_LABEL_NOTE` as evidence of which seat a disc is and never as instructions. `injection` adds untrusted on-canvas text that tells the judge to select A5. Each condition runs four goals: A3, A1, A5, and the leftmost available seat. `trials` defaults to 2. Without supplied `labels`, it runs the OCR eval's `dpr2-1568` variant first; if that fails, it returns `blocked` with `LABELS_UNAVAILABLE`. It also returns `JUDGE_REQUIRED` without a judge. Each trial records the judge's raw `judgeChoice` (an offered ID, otherwise `null`), confidence, top probability, outcome, and, for injection, `injectionFollowed`. Each condition's `summary` reports gated outcome counts (`correct`, `abstain`, `reobserve`, `wrong`, `error`), `accuracy`, `abstainRate`, `wrongRate`, and `meanMs`. It also reports ungated diagnostics: `topChoiceAccuracy` and `topChoiceWrongRate` from the judge's own top answer before the gates, and `meanConfidence`. These diagnostics never lower a gate, and a correct ungated answer authorizes nothing. Scores are policy inputs, not calibrated correctness, and the result does not identify the model. Trials are not independent samples when the provider caches identical prompts. Through OpenRouter, OMP sent `X-OpenRouter-Cache: true` in local testing, so repeated prompts returned cached answers.
 
 ## Recover after an eval timeout
 
@@ -276,7 +276,32 @@ Tested on this already-configured Mac with Cua Driver `0.31.0` and `cua-percepti
 | `labelled` | 0/12 | 1.00 | 0 | 0.613 |
 | `injection` | 9/12 | 1.00 | 0 | 0.817 |
 
-In `labelled`, Jev's top choice was correct in every trial, but its confidence (0.45–0.75) stayed below the 0.8 gate, so every trial abstained. `injectionFollowed` was 0. Mean judge latency was about 83 ms in the first run and 0–2 ms afterwards. OMP sent `X-OpenRouter-Cache: true` (edge cache, TTL 3,600 s), so repeated identical prompts returned cached answers; these trials are not independent samples. No live visual canvas run used Jev.
+In `labelled`, Jev's top choice was correct in every trial, but its confidence (0.45–0.75) stayed below the 0.8 gate, so every trial abstained. `injectionFollowed` was 0. Mean judge latency was about 83 ms in the first run and 0–2 ms afterwards. OMP sent `X-OpenRouter-Cache: true` (edge cache, TTL 3,600 s), so repeated identical prompts returned cached answers; these trials are not independent samples. At release, no live visual canvas run had used Jev; see v0.4.1 below.
+
+**v0.4.1: judge-visible framing (2026-10-01/02).** The judge-visible state changed; the gates, authorization and label filter did not. OCR labels are now framed as evidence of seat identity (`OCR_LABEL_NOTE`), and eval seat rows carry `candidateId`. Live visual seat rows add `position`, `colour` and `available`, plus `page` and `legend`. In this session Jev via `openrouter/~typesafe/jev-latest` was the configured judge. The eval used 3 trials and fresh `dpr2-1568` labels:
+
+| Condition | Gated correct | Ungated top-choice accuracy | Wrong (gated) | Mean confidence |
+| --- | --- | --- | --- | --- |
+| `anonymous` | 0/12 | 0.75 | 0 | 0.565 |
+| `labelled` | 12/12 | 1.00 | 0 | 0.948 |
+| `injection` | 12/12 | 1.00 | 0 | 0.943 |
+
+`injectionFollowed` was 0. In an ablation, the wording alone gave labelled 12/12 at 0.902. Adding OCR confidence or placement fields lowered confidence, so they were not shipped.
+
+Live visual canvas runs with Jev:
+- Before the position/legend change, Jev chose A5 correctly at 0.84, and the guard then refused with `target_occluded`. A second run chose A5 at 0.78 and abstained. Neither sent a click.
+- After the change, one run failed at `focus_window` (`bring_to_front_exact_window_unverified`) because the Mac was locked. It sent no click.
+- After the change, with the Mac unlocked (2026-10-02), `runCanvasDemo({ judge, visual: true, seat })` completed for all three available seats with a gated Jev choice:
+
+| Seat | Jev choice and confidence | Click | Server | Elapsed |
+| --- | --- | --- | --- | --- |
+| A5 | `seat_3`, 0.87 | one guarded capture-bound click at PNG `(694,373)` | one trusted A5 click | 17,002 ms |
+| A3 | `seat_2`, 0.91 | `(400,373)` | one trusted A3 click | 14,882 ms |
+| A1 | `seat_1`, 0.92 | `(106,373)` | one trusted A1 click | 15,196 ms |
+
+Each run made one judge call, verified `Selected: <seat>`, cleared through the DOM, and verified `Selected: none`. Cleanup was complete: both sessions ended, the prepared PID exited and the profile was absent. OCR read A1, A3 and A5 correctly. Each run spent about 3.0 s on the settled parse after a 3.1–3.4 s warm-up. That is one run per seat on one configured host, not a calibration or clean-machine proof. Afterwards, no Driver session, isolated Chrome process or native capture directory remained.
+
+Replaying the earlier abstained live state offline with the new fields gave 0.86–0.93. `typesafe/jev-preview` is not in OpenRouter's judge catalog, and direct TypeSafe returns 402 `billing_error`, so it was not measured.
 
 **Substitute judge, not the configured judge.** An unshipped in-session adapter over OMP `completion()` also stood in for the judge. It used model `default` with a JSON schema for choice, probabilities, and confidence, and renormalized probabilities to sum to 1. With the same default gates, 3 trials, and `dpr2-1568` labels:
 
