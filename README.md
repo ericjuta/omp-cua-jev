@@ -2,7 +2,7 @@
 
 Use OMP's configured `judge` to choose from a local action table, then execute and verify authorized actions through Cua Driver. The plugin supplies diagnostics, absolute helper paths, a bundled skill, and isolated localhost demos. It does not install a model client or keep separate credentials.
 
-**Version: v0.4.1.** Reframes OCR labels for the judge as seat-identity evidence, so Jev clears the unchanged 0.8 gate and completed live visual canvas runs. v0.4.0 added optional read-only visual regions through Cua's separately installed `cua-perception` extension, a judge-selected visual canvas mode, and synthetic OCR and judge-choice evals. These build on capture-bound pixels, deterministic region enumeration, and journaled session recovery. Native AX actions use Driver 0.31.0 `element_token`s only. Tested against Cua Driver `0.31.0` on this Mac only; no compatibility claim is made for other builds. Local results are recorded below. Clean-machine onboarding is still open. There is no npm package.
+**Version: v0.4.2.** Restores native AX observation on Cua Driver 0.35+, whose `get_window_state` omits `elements` unless asked (trycua/cua#4913). v0.4.1 reframed OCR labels for the judge as seat-identity evidence, so Jev clears the unchanged 0.8 gate and completed live visual canvas runs. v0.4.0 added optional read-only visual regions through Cua's separately installed `cua-perception` extension, a judge-selected visual canvas mode, and synthetic OCR and judge-choice evals. These build on capture-bound pixels, deterministic region enumeration, and journaled session recovery. Native AX actions use `element_token`s only (since Driver 0.31.0). Tested against Cua Driver `0.36.0` on this Mac only; no compatibility claim is made for other builds. Local results are recorded below. Clean-machine onboarding is still open. There is no npm package.
 
 ## Requirements
 
@@ -11,7 +11,7 @@ Use OMP's configured `judge` to choose from a local action table, then execute a
 - Cua Driver and a logged-in graphical desktop. On macOS, use macOS 14 or later. The typed-browser demo specifically requires supported system-installed Google Chrome in `/Applications`; a cached test browser, Safari, or Firefox is not a substitute. The native-window helper instead requires a separately supported, explicitly authorized exact native app/window. It does not promise support for every browser or remove permission requirements.
 - Optional: Cua's separately distributed `cua-perception` extension, installed only by a human operator. `visualRegions()`, `/jev canvas visual`, the offline OCR eval, and `/jev eval` with its default OCR labels need it; the core helpers and deterministic demos do not. See [Optional visual regions](#optional-visual-regions-cua-perception).
 
-The current native implementation was tested against Cua Driver `0.31.0`. That exact build is not a tested minimum, and the local verification below is not a compatibility claim for any other build. Older dated results used the Driver builds stated in their historical sections.
+The current native implementation was tested against Cua Driver `0.36.0`. That exact build is not a tested minimum, and the local verification below is not a compatibility claim for any other build. On Driver 0.31.0, use the v0.4.1 tag: later code sends `get_window_state` `tree_format: "elements"`, which the 0.31.0 schema does not declare, and that combination was not tested. Older dated results used the Driver builds stated in their historical sections.
 
 ## Set up the host
 
@@ -28,7 +28,7 @@ The current native implementation was tested against Cua Driver `0.31.0`. That e
 4. Install the pinned Git tag. Quote it so the shell does not eat the `#`:
 
    ```sh
-   omp plugin install 'github:ericjuta/omp-cua-jev#v0.4.1'
+   omp plugin install 'github:ericjuta/omp-cua-jev#v0.4.2'
    ```
 
    Start a new OMP session. There is no npm package. To work on a local checkout instead, clone the repo and run `omp plugin link /absolute/path/to/omp-cua-jev`. `/jev paths` reports the installed resources; `/skill:omp-cua-jev` loads the bundled workflow.
@@ -255,6 +255,13 @@ await nativeTarget.resume();
 - Explicit `screenshot_out_file` and `debug_image_out` paths canonicalize their existing parent, including the macOS `/tmp` alias. This creates no directories, changes no permissions, and rejects symlink or non-file leaves. Use task-owned output locations. Existing regular files remain subject to native policy; preflight is not atomic no-clobber protection.
 - The demo queries `receipt`. Collection completeness alone is insufficient: require no continuation, matching selected/total/ref counts, and visible main-frame evidence for every match. Hidden, occluded, budget-omitted, or unprovable-frame evidence blocks action. Document-wide `unknown` or `offscreen` counters alone need not invalidate a fully covered, visible query. Never infer a missing control from an incomplete query.
 - A complete collection can still fail `SEMANTIC_SNAPSHOT_INCOMPLETE` when a required control is `near_viewport`. The bundled fixture uses a compact, left-aligned single-column layout to keep its controls and confirmation visible in smaller viewports. Keep the `in_viewport` requirement; native window dimensions do not establish the CSS viewport dimensions.
+
+## Local verification, 2026-10-19 (Driver 0.36.0)
+
+Same configured Mac, not a clean-machine run. Driver moved from `0.31.0` to `0.36.0` on the stable channel with `cua-driver update --apply`; TCC grants were preserved and the daemon was relaunched through LaunchServices. `cua-perception` 0.2.1 stayed installed and healthy.
+
+- **Contract drift.** Without `full_output` or `tree_format`, `get_window_state` returned `tree_markdown` and no `elements`, which broke native observation. `tree_format: "elements"` returned `elements` with `element_token`s and `snapshot_id`. Other schema changes were additive: `run_script` and `run_steps` tools, `get_window_state` `display_only`/`full_output`/`since`/`verbose`, `browser_prepare` `delivery_mode`, `start_session` `cursor_motion`, an `element_token` pattern `^s[0-9a-f]{8}:[0-9]+$`, and `set_value` no longer requiring `pid`.
+- **Checks.** `bun test` passed 128 tests. `bun src/doctor.mjs` and `/jev doctor` returned `checks_passed` with no warnings and `testedDriverMatch: true`. `bun src/demo.mjs` completed with complete cleanup. `bun src/canvas-demo.mjs` completed with one guarded `global_input` click on A1, `Selected: A1`, a DOM Clear to `Selected: none`, and complete cleanup. `bun src/evals/ocr-canvas.mjs` completed and removed its temporary files. A read-only native smoke on a System Settings window returned 34 AX elements, a capture-bound screenshot, 10 cua-perception text regions and a satisfied `{window:{exists:true}}` verify. No leaked native directories, isolated profiles or headless Chrome remained. Judge evals were not rerun.
 
 ## Local verification, 2026-10-01
 

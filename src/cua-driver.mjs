@@ -40,6 +40,7 @@ const METHOD_HINTS = new Map([
 // libs/cua-driver/rust/crates/cua-driver-contract/src/visual.rs (VisualParseErrorCode).
 // Observed on the installed 0.31.0 binary with cua-perception 0.2.1: root {code, message, detail?,
 // retryable} parse failures (exit 1, no effect) and element actions accepting only element_token.
+// Rechecked on Driver 0.36.0 (2026-10-19): every code below appears in the binary.
 const REFUSAL_CODES = new Set([
   'protected_resource_scope_invalid',
   'bring_to_front_exact_window_unverified',

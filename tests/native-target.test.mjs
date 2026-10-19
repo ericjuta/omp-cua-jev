@@ -246,7 +246,7 @@ test('one retained session rejects foreign native identities and never widens it
   assert.deepEqual(calls[0], { command: 'call', tool: 'start_session', args: { session: 'owned-native' } });
   for (const call of calls.slice(1, 5)) {
     assert.deepEqual(call.args, {
-      include_accessibility_tree: true, include_screenshot: false, max_elements: 2000, max_depth: 25,
+      include_accessibility_tree: true, include_screenshot: false, tree_format: 'elements', max_elements: 2000, max_depth: 25,
       pid: 4107, window_id: 71, session: 'owned-native',
     });
   }
@@ -1323,14 +1323,14 @@ test('runBounded treats an unchanged after-observation as unverified and does no
   assert.deepEqual(await fixture.dispatches(), [
     { command: 'call', tool: 'start_session', args: { session: 'owned-native' } },
     { command: 'call', tool: 'get_window_state', args: {
-      include_accessibility_tree: true, include_screenshot: false, max_elements: 2000, max_depth: 25,
+      include_accessibility_tree: true, include_screenshot: false, tree_format: 'elements', max_elements: 2000, max_depth: 25,
       pid: 4107, window_id: 71, session: 'owned-native',
     } },
     { command: 'call', tool: 'click', args: {
       element_token: 'save-token', pid: 4107, window_id: 71, delivery_mode: 'background', session: 'owned-native',
     } },
     { command: 'call', tool: 'get_window_state', args: {
-      include_accessibility_tree: true, include_screenshot: false, max_elements: 2000, max_depth: 25,
+      include_accessibility_tree: true, include_screenshot: false, tree_format: 'elements', max_elements: 2000, max_depth: 25,
       pid: 4107, window_id: 71, session: 'owned-native',
     } },
     { command: 'call', tool: 'end_session', args: { session: 'owned-native' } },

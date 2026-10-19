@@ -3,6 +3,16 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Releases are published as Git tags and are not on npm.
 
+## [0.4.2] - 2026-10-19
+
+### Fixed
+
+- **Native observations on Cua Driver 0.35+.** Since Driver 0.35 (trycua/cua#4913), `get_window_state` returns lean markdown without `elements` by default, so every native `observe()`/`settle()` failed with `Missing native elements.` Observations now send `tree_format: "elements"`, which returns `elements` and `snapshot_id` without the markdown tree.
+
+### Changed
+
+- **Doctor targets Driver `0.36.0`.** Tested against Cua Driver `0.36.0` with `cua-perception` 0.2.1 on this Mac only (2026-10-19). Every allowlisted refusal code is still present in the 0.36.0 binary.
+
 ## [0.4.1] - 2026-10-02
 
 ### Changed
@@ -175,6 +185,7 @@ Tested against Cua Driver `0.30.2-nightly.20260927.36294544935`.
 
 - Initial release as `omp-jev`.
 
+[0.4.2]: https://github.com/ericjuta/omp-cua-jev/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/ericjuta/omp-cua-jev/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/ericjuta/omp-cua-jev/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ericjuta/omp-cua-jev/compare/v0.2.0...v0.3.0

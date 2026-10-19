@@ -121,7 +121,8 @@ function observationOptions(options) {
     (max_dimension === undefined || positiveInteger(max_dimension)) &&
     (max_image_dimension === undefined || (Number.isSafeInteger(max_image_dimension) && max_image_dimension >= 0)) &&
     (query === undefined || typeof query === 'string'), 'Invalid bounded AX options.');
-  return { screenshot, webContentOnly, args: { include_accessibility_tree, include_screenshot: false,
+  // Driver 0.35+ returns lean markdown without `elements` unless tree_format asks for them.
+  return { screenshot, webContentOnly, args: { include_accessibility_tree, include_screenshot: false, tree_format: 'elements',
     max_elements, max_depth, ...pick(options, ['max_dimension', 'max_image_dimension', 'query']) } };
 }
 // Caller visual options map to the native parse options; absent keys stay absent.

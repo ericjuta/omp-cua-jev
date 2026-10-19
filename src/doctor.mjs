@@ -6,7 +6,7 @@ import { journalDirectory, readJournal } from './journal.mjs';
 
 const MINIMUM_BUN = '1.3.14';
 const MINIMUM_OMP = '18.2.7';
-const TESTED_DRIVER = '0.31.0';
+const TESTED_DRIVER = '0.36.0';
 const TIMEOUT_MS = 5_000;
 // extension status re-verifies the installed artifact (observed 3.8-4.7 s for cua-perception 0.2.1).
 const EXTENSION_STATUS_TIMEOUT_MS = 15_000;

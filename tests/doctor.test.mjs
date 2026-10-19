@@ -16,13 +16,13 @@ const extension = overrides => ({
   installed: true, healthy: true, activeVersion: '0.2.1',
   trust: 'publisher-verified', evidenceClass: 'production-publisher-verified', ...overrides,
 });
-// Driver 0.31.0 prints prose, then an `input_schema:` line followed by the JSON schema.
+// Driver 0.36.0 prints prose, then an `input_schema:` line followed by the JSON schema.
 const describe = (name, properties) => `name: ${name}\n\ndescription:\nprose mentions capture_id and element_token\n\ninput_schema:\n${
   JSON.stringify({ type: 'object', properties, required: [] }, null, 2)}\n`;
 const TOKEN_CLICK = { capture_id: { type: 'string' }, element_token: { type: 'string' }, x: { type: 'number' } };
 
 const RESPONSES = {
-  version: { stdout: 'cua-driver 0.31.0\n' },
+  version: { stdout: 'cua-driver 0.36.0\n' },
   status: { stdout: 'Cua Driver daemon is running\n  permission mode: standard (built_in_default)\n' },
   permissions: {
     stdout: json({ source: { attribution: 'driver-daemon', bundle_id: 'com.trycua.driver' }, accessibility: true, screen_recording: true }),
@@ -64,7 +64,7 @@ process.exitCode = response.exitCode ?? 0;
 const codes = (list, pattern = /^(PERCEPTION|VISUAL_REGIONS|ELEMENT_TOKENS)_/) =>
   list.map(entry => entry.code).filter(code => pattern.test(code)).sort();
 
-test('a healthy 0.31.0 driver reports token and visual capabilities from read-only probes only', async t => {
+test('a healthy 0.36.0 driver reports token and visual capabilities from read-only probes only', async t => {
   const { report, invocations } = await run(t);
   assert.deepEqual(invocations.map(argv => JSON.stringify(argv)).sort(), [
     ['--version'], ['describe', 'click'], ['describe', 'parse_visual_regions'],
