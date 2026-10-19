@@ -333,7 +333,7 @@ export function visualSeatCandidates(seats, labels) {
  * Results add deterministic:false and visual {parse, labels, recall, judge,
  * warmUp, parses}; ocrText keeps only label-shaped text, otherwise null.
  * not_installed reports status:"blocked" PERCEPTION_NOT_INSTALLED before any
- * click; abstained, denied and limit without a click report the loop status.
+ * click; abstained, denied, limit and no_progress without a click report the loop status.
  */
 export async function runCanvasDemo({ judge = unavailableJudge, onProgress, binary = 'cua-driver', seat,
   visual = false } = {}) {
@@ -895,7 +895,7 @@ export async function runCanvasDemo({ judge = unavailableJudge, onProgress, bina
   const clickless = counts.select === 0 && (finalServer === null || untouched(finalServer));
   const blocked = visual && !taskComplete && BLOCKED.has(taskFailure?.code) && clickless;
   const stopped = visual && !taskComplete && !refused && !blocked && clickless && finalServer !== null
-    && ['abstained', 'denied', 'limit'].includes(loopResult?.status) ? loopResult.status : null;
+    && ['abstained', 'denied', 'limit', 'no_progress'].includes(loopResult?.status) ? loopResult.status : null;
   const success = taskComplete && cleanup.complete;
   return {
     success, status: success ? 'complete' : taskComplete ? 'cleanup_incomplete' : refused ? 'refused'
@@ -913,6 +913,9 @@ export async function runCanvasDemo({ judge = unavailableJudge, onProgress, bina
         status: loopResult.status, steps: loopResult.steps, history: loopResult.history.map(entry => ({
           step: entry.step, observationId: entry.observationId, candidateId: entry.candidateId ?? null,
           status: entry.status, startedAt: entry.startedAt, finishedAt: entry.finishedAt,
+          // Decision provenance as recorded by runBounded; deterministic scores stay null, absent keys stay absent.
+          ...Object.fromEntries(['source', 'confidence', 'probability', 'deterministicDeclined']
+            .filter(key => Object.hasOwn(entry, key)).map(key => [key, entry[key]])),
         })),
       } },
     cleanup,

@@ -11,10 +11,12 @@ const DAEMON_PID = /^\s*pid:\s*(\d+)\s*$/gm;
 const JOURNAL_HINT = 'The session journal could not be updated, so no native request was dispatched. Check the journal directory.';
 const JOURNALED_HINT = 'This session label is already journaled. Use resume() to continue your own orphan or recoverSessions() to end it; do not start() it again.';
 const RESUME_HINT = 'resume() needs an explicit, journaled session label that get_session reports active. A failed resume closes this instance; use session recovery, not start(), for that label.';
-// call() refuses tools that need lifecycle, exact-session, or scoped-window checks, and
-// operator-owned tools this plugin never dispatches.
+// call() refuses tools that need lifecycle, exact-session, or scoped-window checks,
+// operator-owned tools, and multi-action tools this plugin cannot guard per step.
 const METHOD_HINTS = new Map([
   ['install_extension', 'Extension installation is operator-only: an operator inspects and installs a reviewed, signed catalog with cua-driver extension inspect/install --catalog. Never install from a task or chooser.'],
+  ['run_steps', 'run_steps batches actions without per-step target and occlusion checks. Use individual guarded native-target actions, observing and verifying the exact window between steps.'],
+  ['run_script', 'run_script executes a script without per-action target and occlusion checks. Use individual guarded native-target actions, observing and verifying the exact window between actions.'],
   ['start_session', 'Use start() or resume() for this instance\'s owned session lifecycle.'],
   ['end_session', 'Use end() to close this instance\'s owned session.'],
   ['get_session', 'Use getSession() to read this instance\'s session; it grants no authority.'],
@@ -441,10 +443,11 @@ async function canonicalOutputPath(path) {
  * canonical existing parent. No directory/file is created; symlink/non-file leaves fail
  * locally. Existing regular leaves still use native policy. This is not atomic no-clobber.
  * Errors name the validated tool. A nonzero exit or rejected receipt may expose only an
- * allowlisted refusalCode from refusal.code or root code, with static hints for actionable
+ * allowlisted refusalCode from the first own string code in order: refusal.code,
+ * error.code, then root code. Non-string or inherited codes do not block a later one;
+ * an unknown string still takes precedence but stays private. Static hints cover actionable
  * codes, including cua-perception extension codes; exit 75 is the OS permission gate.
- * Nested codes take precedence. Unknown codes and
- * all native messages/details stay private. Nonzero exits always reject, even with a positive
+ * All native messages/details stay private. Nonzero exits always reject, even with a positive
  * receipt. Every dispatched failure remains unknownOutcome:true.
  * One start or resume attempt per instance. Explicit end retries are allowed until confirmed
  * closed. A successful end is terminal. Labels use 1-64 lowercase ASCII letters, digits, '_'
@@ -582,8 +585,10 @@ export function createCuaDriver(options = {}) {
       exitCode = output.exitCode;
       const receipt = JSON.parse(output.stdout);
       if (output.failed || !accepts(receipt, tool, session, requestArgs)) {
-        const refusal = receipt?.refusal;
-        refusalCode = isRecord(refusal) && Object.hasOwn(refusal, 'code') ? refusal.code : receipt?.code;
+        const root = isRecord(receipt) ? receipt : undefined;
+        refusalCode = [root?.refusal, root?.error, root]
+          .map(source => isRecord(source) && Object.hasOwn(source, 'code') ? source.code : undefined)
+          .find(code => typeof code === 'string');
         throw failure(true);
       }
       if (kind === 'resume') {

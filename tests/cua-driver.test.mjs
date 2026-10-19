@@ -164,41 +164,112 @@ test('scope and typed-browser refusals expose safe hints without request or proc
   ]);
 });
 
-test('failed processes keep unknown or malformed codes and raw output private', async t => {
+test('failed processes select the first string refusal code and keep native detail private', async t => {
   const session = 'owned-private-failures';
   const secret = 'private-sentinel Bearer token https://private.invalid';
+  const scopeHint = 'Check the exact protected resource path. Screenshot output needs an existing canonical parent and a non-symlink file leaf. Native policy still applies; do not retry automatically.';
+  const browserHint = 'The typed-browser route is unavailable for this target. This refusal does not test native AX or pixel control and does not authorize switching routes.';
+  const captureHint = 'Take get_window_state with a screenshot in THIS session immediately before the pixel action; captures are single-use and session-scoped.';
   const cases = [
     {
+      name: 'unknown refusal shadows recognized error and root',
       receipt: {
         status: 'refused', code: 'browser_route_unavailable',
+        error: { code: 'protected_resource_scope_invalid', detail: secret },
         refusal: { code: secret, message: secret, detail: secret },
       },
-      exitCode: 19,
+      exitCode: 19, message: 'Cua Driver set_value request failed.',
     },
     {
+      name: 'null refusal falls through to recognized root',
       receipt: {
         status: 'refused', code: 'protected_resource_scope_invalid',
         refusal: { code: null, message: secret },
       },
-      exitCode: 23,
+      exitCode: 23, refusalCode: 'protected_resource_scope_invalid', hint: scopeHint,
+      message: 'Cua Driver set_value request refused: protected_resource_scope_invalid.',
     },
-    { stdout: `${secret} {"code":"protected_resource_scope_invalid"`, exitCode: 29 },
-    { receipt: { status: 'error', message: secret }, exitCode: 31 },
+    {
+      name: 'recognized scope error.code without root or refusal',
+      receipt: { status: 'error', error: { code: 'protected_resource_scope_invalid', message: secret, hint: secret } },
+      exitCode: 33, refusalCode: 'protected_resource_scope_invalid', hint: scopeHint,
+      message: 'Cua Driver set_value request refused: protected_resource_scope_invalid.',
+    },
+    {
+      name: 'recognized browser error.code without root or refusal',
+      receipt: { status: 'error', error: { code: 'browser_route_unavailable', message: secret, detail: secret } },
+      exitCode: 35, refusalCode: 'browser_route_unavailable', hint: browserHint,
+      message: 'Cua Driver set_value request refused: browser_route_unavailable.',
+    },
+    {
+      name: 'recognized refusal wins over recognized error and root',
+      receipt: {
+        code: 'capture_not_found',
+        refusal: { code: 'browser_route_unavailable', message: secret },
+        error: { code: 'protected_resource_scope_invalid', detail: secret },
+      },
+      exitCode: 37, refusalCode: 'browser_route_unavailable', hint: browserHint,
+      message: 'Cua Driver set_value request refused: browser_route_unavailable.',
+    },
+    {
+      name: 'recognized error wins over recognized root',
+      receipt: { code: 'browser_route_unavailable', error: { code: 'protected_resource_scope_invalid', message: secret } },
+      exitCode: 39, refusalCode: 'protected_resource_scope_invalid', hint: scopeHint,
+      message: 'Cua Driver set_value request refused: protected_resource_scope_invalid.',
+    },
+    {
+      name: 'non-string refusal falls through to recognized error before root',
+      receipt: {
+        code: 'protected_resource_scope_invalid',
+        refusal: { code: 12, message: secret },
+        error: { code: 'browser_route_unavailable', detail: secret },
+      },
+      exitCode: 41, refusalCode: 'browser_route_unavailable', hint: browserHint,
+      message: 'Cua Driver set_value request refused: browser_route_unavailable.',
+    },
+    {
+      name: 'non-string error and refusal fall through to recognized root',
+      receipt: {
+        code: 'capture_not_found',
+        refusal: { code: false, message: secret },
+        error: { code: null, detail: secret },
+      },
+      exitCode: 43, refusalCode: 'capture_not_found', hint: captureHint,
+      message: 'Cua Driver set_value request refused: capture_not_found.',
+    },
+    {
+      name: 'unknown error shadows recognized root',
+      receipt: { code: 'browser_route_unavailable', error: { code: secret, message: secret } },
+      exitCode: 45, message: 'Cua Driver set_value request failed.',
+    },
+    {
+      name: 'malformed stdout cannot supply a code',
+      stdout: `${secret} {"code":"protected_resource_scope_invalid"`, exitCode: 29,
+      message: 'Cua Driver set_value request failed.',
+    },
+    {
+      name: 'missing codes cannot be inferred from stderr',
+      receipt: { status: 'error', message: secret }, exitCode: 31,
+      message: 'Cua Driver set_value request failed.',
+    },
   ];
   const { driver, dispatches } = await createFixture(t, session, [
     { tool: 'start_session', receipt: { session, active: true } },
-    ...cases.map(step => ({
-      tool: 'set_value', ...step,
+    ...cases.map(({ receipt, stdout, exitCode }) => ({
+      tool: 'set_value', receipt, stdout, exitCode,
       stderr: JSON.stringify({ code: 'browser_route_unavailable', message: secret }),
     })),
     { tool: 'end_session', receipt: { session, active: false } },
   ]);
   await driver.start();
-  for (const { exitCode } of cases) {
-    await assert.rejects(
-      driver.call('set_value', { value: secret }),
-      error => assertPrivateFailure(error, { exitCode }),
-    );
+  for (const { name, exitCode, refusalCode, hint, message } of cases) {
+    await assert.rejects(driver.call('set_value', { value: secret }), error => {
+      assertPrivateFailure(error, { exitCode, refusalCode, hint: hint !== undefined });
+      assert.equal(error.tool, 'set_value');
+      assert.equal(error.message, message);
+      assert.equal(error.hint, hint);
+      return true;
+    }, name);
   }
   await driver.end();
   assert.deepEqual(await dispatches(), [
@@ -1080,6 +1151,46 @@ test('install_extension is refused locally for the operator while the active ses
   assert.deepEqual(await dispatches(), [
     ...started,
     { command: 'call', tool: 'set_value', args: { value: 'after-install-refusal', session } },
+    { command: 'call', tool: 'end_session', args: { session } },
+  ]);
+});
+
+// Mutation targets: dispatch run_steps/run_script, let arguments or options bypass the reservation, or spend the session.
+test('run_steps and run_script are refused locally while the active session stays usable', async t => {
+  const session = 'owned-batch-reserved';
+  const { driver, dispatches } = await createFixture(t, session, [
+    { tool: 'start_session', receipt: { session, active: true } },
+    { tool: 'set_value', receipt: { status: 'ok' } },
+    { tool: 'end_session', receipt: { session, active: false } },
+  ]);
+  await driver.start();
+  const started = [{ command: 'call', tool: 'start_session', args: { session } }];
+  const steps = { pid: 65120, window_id: 15216, steps: [{ action: 'click', role: 'AXButton', name: 'private-sentinel' }] };
+  const script = { script: 'await cua.click({ role: "AXButton", name: "private-sentinel" });' };
+  const cases = [
+    ['run_steps', () => driver.call('run_steps', steps)],
+    ['run_steps', () => driver.call('run_steps', steps, { timeoutMs: 1_000 })],
+    ['run_steps', () => driver.call('run_steps')],
+    ['run_script', () => driver.call('run_script', script)],
+    ['run_script', () => driver.call('run_script', script, { timeoutMs: 1_000 })],
+    ['run_script', () => driver.call('run_script')],
+  ];
+  for (const [tool, operation] of cases) {
+    await assert.rejects(operation(), error => {
+      assertPrivateFailure(error, { hint: true, unknownOutcome: false });
+      assert.equal(error.tool, tool);
+      assert.equal(error.message, `Cua Driver ${tool} request failed.`);
+      assert.match(error.hint, /without per-(?:step|action) target and occlusion checks/);
+      assert.match(error.hint, /Use individual guarded native-target actions/);
+      return true;
+    }, tool);
+    assert.deepEqual(await dispatches(), started);
+  }
+  assert.deepEqual(await driver.call('set_value', { value: 'after-batch-refusal' }), { status: 'ok' });
+  await driver.end();
+  assert.deepEqual(await dispatches(), [
+    ...started,
+    { command: 'call', tool: 'set_value', args: { value: 'after-batch-refusal', session } },
     { command: 'call', tool: 'end_session', args: { session } },
   ]);
 });

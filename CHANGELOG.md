@@ -3,6 +3,26 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Releases are published as Git tags and are not on npm.
 
+## [0.4.3] - 2026-10-19
+
+### Added
+
+- **No-progress cap (from trycua/cua#4734).** `runBounded` takes `maxReobserves` (default 3, safe integer ≥ 1). Consecutive reobserve decisions, whether judge-requested or forced by a staleness guard, return the new terminal status `no_progress` without another observation; a verified action resets the count. `no_progress` wins over `limit` on the same decision. The visual canvas reports it as a clean stop without a click.
+- **Decision provenance (from trycua/cua#4316).** Every decision records `source`: `judge`, `deterministic`, or `guard`. Action history entries record `confidence` and `probability`. A `runBounded` `deterministicId` callback may decline with `{id: null, reason}`, kept as `deterministicDeclined`; any other shape throws. Judge input is unchanged.
+
+### Changed
+
+- **Deterministic picks report `confidence: null` and `probability: null`** instead of sentinel scores of 1.
+- **Refusal code lookup (follow-up to trycua/cua#4902).** The first own string code among `refusal.code`, `error.code`, then root `code` is used, still filtered through the allowlist.
+- **`run_steps` and `run_script` are reserved.** Driver 0.36.0's batch and script tools bypass the one-authorized-action → observe → verify contract, so direct `call()` refuses them locally before dispatch.
+- **`/jev` commands and docs use `print`.** Current OMP JS eval (18.12.3) no longer defines `display`, so `/jev demo`, `canvas`, `canvas visual` and `eval` failed with `ReferenceError: display is not defined`.
+- **Onboarding docs.** Driver setup follows the current Cua quickstart (`cua-driver permissions grant` launches the app via LaunchServices) and lists readiness checks; `/jev doctor` notes that `omp -p` exits 0 even when blocked. Fresh-HOME install and doctor were rehearsed on this Mac; a real clean-Mac run (TCC grants, Chrome install) is still not done.
+- **Fresh isolated Chrome AX note.** On Driver 0.36.0, web-content AX was empty within ~0.3 s of navigation and present ~2 s later (2 trials).
+
+### Verified
+
+- `bun test` 137 pass. Doctor `checks_passed` on Driver 0.36.0. `bun src/demo.mjs` and `bun src/canvas-demo.mjs` complete with deterministic provenance. Live `/jev canvas visual` via the configured judge completed: judge pick at confidence 0.87 / probability 0.9, deterministic Clear, recall 1, complete cleanup.
+
 ## [0.4.2] - 2026-10-19
 
 ### Fixed
@@ -185,6 +205,7 @@ Tested against Cua Driver `0.30.2-nightly.20260927.36294544935`.
 
 - Initial release as `omp-jev`.
 
+[0.4.3]: https://github.com/ericjuta/omp-cua-jev/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/ericjuta/omp-cua-jev/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/ericjuta/omp-cua-jev/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/ericjuta/omp-cua-jev/compare/v0.3.0...v0.4.0

@@ -461,6 +461,9 @@ export async function runDemo({ judge = unavailableJudge, onProgress, binary = '
         status: loopResult.status, steps: loopResult.steps, history: loopResult.history.map(entry => ({
           step: entry.step, observationId: entry.observationId, candidateId: entry.candidateId ?? null,
           status: entry.status, startedAt: entry.startedAt, finishedAt: entry.finishedAt,
+          // Decision provenance as recorded by runBounded; deterministic scores stay null, absent keys stay absent.
+          ...Object.fromEntries(['source', 'confidence', 'probability', 'deterministicDeclined']
+            .filter(key => Object.hasOwn(entry, key)).map(key => [key, entry[key]])),
         })),
       } },
     cleanup,

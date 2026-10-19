@@ -347,3 +347,299 @@ test('verified progress at the exact age threshold does not imply task completio
   assert.equal(completionChecks, 2);
   assert.deepEqual(app, { owned: 'original receipt', other: '', writes: 1, closed: false });
 });
+
+const reobserveAnswer = () => ({
+  action: {
+    type: 'choice', choice: 'reobserve', confidence: 0.99,
+    probabilities: { enter: 0, abstain: 0, reobserve: 1 },
+  },
+});
+
+function writeOwned(app, candidate) {
+  const { target, payload } = candidate.action.args;
+  app[target] = payload.text;
+  app.writes++;
+  return { accepted: true };
+}
+
+const verifyOwned = (_candidate, _before, after) => after.state.owned === 'original receipt' && after.state.other === '';
+
+test('deterministic choices report null scores and deterministic provenance', async t => {
+  clock(t);
+  const { app, candidates } = fixture();
+  let judgeCalls = 0;
+  const choice = await chooseAction({
+    judge: async () => { judgeCalls++; return answer(); },
+    goal: 'Enter the receipt',
+    observation: observation(app),
+    candidates,
+    deterministicId: 'enter',
+  });
+  assert.equal(choice.kind, 'action');
+  assert.equal(choice.candidate.id, 'enter');
+  assert.equal(choice.confidence, null);
+  assert.equal(choice.probability, null);
+  assert.equal(choice.source, 'deterministic');
+  assert.equal(judgeCalls, 0);
+
+  const judged = await chooseAction({
+    judge: async () => answer(),
+    goal: 'Enter the receipt',
+    observation: observation(app),
+    candidates,
+  });
+  assert.equal(judged.confidence, 0.99);
+  assert.equal(judged.probability, 0.99);
+  assert.equal(judged.source, 'judge');
+
+  // chooseAction keeps the string|null contract; only runBounded's callback may decline.
+  await assert.rejects(chooseAction({
+    judge: async () => answer(),
+    goal: 'Enter the receipt',
+    observation: observation(app),
+    candidates,
+    deterministicId: { id: null, reason: 'No rule matched' },
+  }), TypeError);
+
+  let observations = 0;
+  const result = await runBounded({
+    goal: 'Enter the owned receipt', maxSteps: 3, maxMs: 1000, maxAgeMs: 50,
+    observe: () => observation(app, `owned:${++observations}`),
+    getCandidates: () => candidates,
+    isDone: current => current.state.writes === 1,
+    deterministicId: () => 'enter',
+    judge: async () => { judgeCalls++; return answer(); },
+    authorize: () => true,
+    execute: candidate => writeOwned(app, candidate),
+    verify: verifyOwned,
+  });
+  assert.equal(result.status, 'complete');
+  assert.equal(judgeCalls, 0);
+  assert.equal(result.history.length, 1);
+  const [entry] = result.history;
+  assert.equal(entry.status, 'verified');
+  assert.equal(entry.candidateId, 'enter');
+  assert.equal(entry.source, 'deterministic');
+  assert.equal(entry.confidence, null);
+  assert.equal(entry.probability, null);
+});
+
+test('a declined deterministic rule records its reason and consults the judge with unchanged history', async t => {
+  clock(t);
+  const { app, candidates } = fixture();
+  const reason = 'Visual canvas has no rule-selectable seat';
+  const judgedHistories = [];
+  const ruleArgs = [];
+  let observations = 0;
+  const result = await runBounded({
+    goal: 'Enter the owned receipt twice', maxSteps: 3, maxMs: 1000, maxAgeMs: 50,
+    observe: () => observation(app, `owned:${++observations}`),
+    getCandidates: () => candidates,
+    isDone: current => current.state.writes === 2,
+    deterministicId: (current, offered) => {
+      ruleArgs.push([current.id, offered]);
+      return { id: null, reason };
+    },
+    judge: async state => { judgedHistories.push(state.history); return answer(); },
+    authorize: () => true,
+    execute: candidate => writeOwned(app, candidate),
+    verify: verifyOwned,
+  });
+
+  assert.equal(result.status, 'complete');
+  assert.deepEqual(ruleArgs, [['owned:1', candidates], ['owned:2', candidates]]);
+  assert.equal(judgedHistories.length, 2);
+  assert.deepEqual(judgedHistories[0], []);
+  // The judge sees only the projected fields, never provenance, scores or decline reasons.
+  assert.deepEqual(judgedHistories[1], [{ observationId: 'owned:1', candidateId: 'enter', status: 'verified' }]);
+  assert.equal(result.history.length, 2);
+  for (const entry of result.history) {
+    assert.equal(entry.deterministicDeclined, reason);
+    assert.equal(entry.source, 'judge');
+    assert.equal(entry.confidence, 0.99);
+    assert.equal(entry.probability, 0.99);
+    assert.equal(entry.status, 'verified');
+  }
+});
+
+test('invalid deterministic callback results throw before judging or acting', async t => {
+  clock(t);
+  class Declined { id = null; reason = 'No rule matched'; }
+  const invalid = [
+    undefined,
+    0,
+    '',
+    'missing',
+    { id: 'enter' },
+    { id: 'enter', reason: 'Rule matched' },
+    { id: null },
+    { id: null, reason: '' },
+    { id: null, reason: 7 },
+    { id: null, reason: 'x'.repeat(201) },
+    { id: null, reason: 'No rule matched', extra: true },
+    { reason: 'No rule matched' },
+    new Declined(),
+    new Proxy({ id: null, reason: 'No rule matched' }, {}),
+  ];
+  for (const value of invalid) {
+    const { app, candidates } = fixture();
+    let judgeCalls = 0;
+    let actions = 0;
+    await assert.rejects(runBounded({
+      goal: 'Enter the owned receipt', maxSteps: 3, maxMs: 1000, maxAgeMs: 50,
+      observe: () => observation(app),
+      getCandidates: () => candidates,
+      isDone: current => current.state.closed,
+      deterministicId: () => value,
+      judge: async () => { judgeCalls++; return answer(); },
+      authorize: () => true,
+      execute: candidate => { actions++; return writeOwned(app, candidate); },
+      verify: verifyOwned,
+    }), TypeError, `deterministicId result ${String(value?.reason ?? value)}`);
+    assert.equal(judgeCalls, 0);
+    assert.equal(actions, 0);
+  }
+
+  // A 200-character reason is the inclusive bound.
+  const { app, candidates } = fixture();
+  const reason = 'x'.repeat(200);
+  const result = await runBounded({
+    goal: 'Enter the owned receipt', maxSteps: 1, maxMs: 1000, maxAgeMs: 50,
+    observe: () => observation(app),
+    getCandidates: () => candidates,
+    isDone: current => current.state.writes === 1,
+    deterministicId: () => ({ id: null, reason }),
+    judge: async () => answer(),
+    authorize: () => true,
+    execute: candidate => writeOwned(app, candidate),
+    verify: verifyOwned,
+  });
+  assert.equal(result.status, 'complete');
+  assert.equal(result.history[0].deterministicDeclined, reason);
+});
+
+test('consecutive judge reobservations stop at maxReobserves before observing again', async t => {
+  clock(t);
+  for (const [maxReobserves, expected] of [[undefined, 3], [1, 1], [3, 3], [5, 5]]) {
+    const { app, candidates } = fixture();
+    let observations = 0;
+    let judgeCalls = 0;
+    const result = await runBounded({
+      goal: 'Enter the owned receipt', maxSteps: 10, maxMs: 1000, maxAgeMs: 50,
+      ...(maxReobserves === undefined ? {} : { maxReobserves }),
+      observe: () => observation(app, `owned:${++observations}`),
+      getCandidates: () => candidates,
+      isDone: current => current.state.closed,
+      judge: async () => { judgeCalls++; return reobserveAnswer(); },
+      authorize: () => true,
+      execute: candidate => writeOwned(app, candidate),
+      verify: verifyOwned,
+    });
+    // Initial observe plus one after each of the first cap-1 reobservations;
+    // the cap-th reobservation finishes no_progress without observing again.
+    assert.equal(result.status, 'no_progress', `maxReobserves ${maxReobserves}`);
+    assert.equal(observations, expected, `maxReobserves ${maxReobserves}`);
+    assert.equal(judgeCalls, expected);
+    assert.equal(result.steps, expected);
+    const tail = result.history.slice(-Math.min(expected, 4));
+    assert.equal(tail.length, Math.min(expected, 4));
+    for (const entry of tail) {
+      assert.equal(entry.status, 'reobserve');
+      assert.equal(entry.source, 'judge');
+    }
+    assert.deepEqual(app, { owned: '', other: '', writes: 0, closed: false });
+  }
+});
+
+test('no_progress wins over the step limit on the same iteration', async t => {
+  clock(t);
+  const { app, candidates } = fixture();
+  let observations = 0;
+  const result = await runBounded({
+    goal: 'Enter the owned receipt', maxSteps: 2, maxReobserves: 2, maxMs: 1000, maxAgeMs: 50,
+    observe: () => observation(app, `owned:${++observations}`),
+    getCandidates: () => candidates,
+    isDone: current => current.state.closed,
+    judge: async () => reobserveAnswer(),
+    authorize: () => true,
+    execute: candidate => writeOwned(app, candidate),
+    verify: verifyOwned,
+  });
+  assert.equal(result.status, 'no_progress');
+  assert.equal(result.steps, 2);
+  assert.equal(observations, 2);
+});
+
+test('a verified action resets the reobservation streak', async t => {
+  clock(t);
+  const { app, candidates } = fixture();
+  const script = ['reobserve', 'reobserve', 'enter', 'reobserve', 'reobserve', 'reobserve', 'reobserve'];
+  let observations = 0;
+  let judgeCalls = 0;
+  let actions = 0;
+  const result = await runBounded({
+    goal: 'Enter the owned receipt', maxSteps: 10, maxReobserves: 3, maxMs: 1000, maxAgeMs: 50,
+    observe: () => observation(app, `owned:${++observations}`),
+    getCandidates: () => candidates,
+    isDone: current => current.state.closed,
+    judge: async () => (script[judgeCalls++] === 'enter' ? answer() : reobserveAnswer()),
+    authorize: () => true,
+    execute: candidate => { actions++; return writeOwned(app, candidate); },
+    verify: verifyOwned,
+  });
+  // Without a reset the streak would reach 3 at step 4. With it: steps 4-6 reobserve, then cap.
+  // Observes: initial, two reobservations, the verified after-snapshot, then two more reobservations.
+  assert.equal(result.status, 'no_progress');
+  assert.equal(result.steps, 6);
+  assert.equal(judgeCalls, 6);
+  assert.equal(actions, 1);
+  assert.equal(observations, 6);
+  assert.deepEqual(result.history.map(entry => [entry.step, entry.status, entry.source]), [
+    [3, 'verified', 'judge'],
+    [4, 'reobserve', 'judge'],
+    [5, 'reobserve', 'judge'],
+    [6, 'reobserve', 'judge'],
+  ]);
+  assert.deepEqual(app, { owned: 'original receipt', other: '', writes: 1, closed: false });
+});
+
+test('stale evidence after authorization is recorded as a guard reobservation', async t => {
+  const time = clock(t);
+  const { app, candidates } = fixture();
+  let observations = 0;
+  let actions = 0;
+  const result = await runBounded({
+    goal: 'Enter the owned receipt', maxSteps: 1, maxMs: 1000, maxAgeMs: 50,
+    observe: () => observation(app, `owned:${++observations}`),
+    getCandidates: () => candidates,
+    isDone: current => current.state.closed,
+    judge: async () => answer(),
+    authorize: () => { time.advance(51); return true; },
+    execute: candidate => { actions++; return writeOwned(app, candidate); },
+    verify: verifyOwned,
+  });
+  assert.equal(result.status, 'limit');
+  assert.equal(actions, 0);
+  assert.equal(result.history.length, 1);
+  assert.equal(result.history[0].status, 'reobserve');
+  assert.equal(result.history[0].source, 'guard');
+});
+
+test('maxReobserves must be a safe integer of at least one', async t => {
+  clock(t);
+  for (const maxReobserves of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53, '3', null, true]) {
+    const { app, candidates } = fixture();
+    let observations = 0;
+    await assert.rejects(runBounded({
+      goal: 'Enter the owned receipt', maxSteps: 3, maxReobserves, maxMs: 1000, maxAgeMs: 50,
+      observe: () => { observations++; return observation(app); },
+      getCandidates: () => candidates,
+      isDone: current => current.state.closed,
+      judge: async () => answer(),
+      authorize: () => true,
+      execute: candidate => writeOwned(app, candidate),
+      verify: verifyOwned,
+    }), TypeError, `maxReobserves ${String(maxReobserves)}`);
+    assert.equal(observations, 0);
+  }
+});

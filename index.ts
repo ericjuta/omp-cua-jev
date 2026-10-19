@@ -99,12 +99,12 @@ export default function jev(pi: ExtensionAPI) {
       const module = action === 'demo' ? paths.demo
         : action === 'canvas' || action === 'canvas visual' ? paths.canvasDemo
           : action === 'eval' ? paths.judgeEval : paths.probe;
-      const invocation = action === 'demo' ? 'runDemo({ judge, onProgress: display })'
-        : action === 'canvas' ? 'runCanvasDemo({ judge, onProgress: display })'
-          : action === 'canvas visual' ? 'runCanvasDemo({ judge, onProgress: display, visual: true })'
-            : action === 'eval' ? 'runJudgeChoiceEval({ judge, onProgress: display })' : 'probeJudge(judge)';
+      const invocation = action === 'demo' ? 'runDemo({ judge, onProgress: print })'
+        : action === 'canvas' ? 'runCanvasDemo({ judge, onProgress: print })'
+          : action === 'canvas visual' ? 'runCanvasDemo({ judge, onProgress: print, visual: true })'
+            : action === 'eval' ? 'runJudgeChoiceEval({ judge, onProgress: print })' : 'probeJudge(judge)';
       // Eval is a separate host runtime; the installed module path is selected at command time.
-      const code = `display(await (await import(${JSON.stringify(module)})).${invocation});`;
+      const code = `print(await (await import(${JSON.stringify(module)})).${invocation});`;
       if (ctx.mode === 'print' || ctx.mode === 'json') {
         report({ status: 'not_started', reason: 'Use this as an initial eval instruction in print mode, or run the command interactively.', language: 'js', code }, ctx);
         return;
