@@ -19,7 +19,7 @@ All notable changes to this project are documented here. The format follows
 ### Verified
 
 - On Driver 0.36.0, 164 tests passed; an exact-window AX wait and the owned browser demo completed with session cleanup. An annotated-receipt proxy also exercised the browser demo successfully.
-- An isolated Driver 0.38.0 probe matched 22 input schemas and passed native AX observation and cleanup. Screenshot and visual-region compatibility remain unverified; the isolated daemon lacked Screen Recording permission and the perception extension.
+- An isolated Driver 0.38.0 probe matched 22 input schemas and passed native AX observation and cleanup. After Screen Recording was granted, the probe captured a screenshot through `observe({ screenshot: true })`; a private copy of cua-perception 0.2.1 parsed 8 regions. This is not a shipped installed-driver compatibility claim.
 
 ## [0.4.3] - 2026-10-19
 
