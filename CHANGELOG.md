@@ -3,6 +3,24 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Releases are published as Git tags and are not on npm.
 
+## [0.4.4] - 2026-10-27
+
+### Added
+
+- Optional caller-defined readiness gates in `runBounded` before completion, selection, and post-action verification. Bounded read-only waits return explicit `wait_for_content`, `foreground_required`, or `stop` outcomes without focus or route escalation.
+- `nativeTarget.waitForContent()` polls exact-window AX evidence under caller-defined readiness with bounded time and cancellation. Only a ready observation remains eligible for an AX action.
+- Loop and demo histories distinguish accepted delivery from independent verification; cleanup remains separately caller-owned and reported by the demos.
+- Static safe guidance for Driver 0.37/0.38 recovery annotations, without forwarding suggested native calls or automatically retrying. Based on upstream source inspection, not live action testing on those versions.
+
+### Fixed
+
+- Snapshot validated readiness fields across asynchronous boundaries, yield before content reobservation, preserve interrupted waits, and reject stale post-action evidence before verification or completion.
+
+### Verified
+
+- On Driver 0.36.0, 164 tests passed; an exact-window AX wait and the owned browser demo completed with session cleanup. An annotated-receipt proxy also exercised the browser demo successfully.
+- An isolated Driver 0.38.0 probe matched 22 input schemas and passed native AX observation and cleanup. Screenshot and visual-region compatibility remain unverified; the isolated daemon lacked Screen Recording permission and the perception extension.
+
 ## [0.4.3] - 2026-10-19
 
 ### Added
@@ -205,6 +223,7 @@ Tested against Cua Driver `0.30.2-nightly.20260927.36294544935`.
 
 - Initial release as `omp-jev`.
 
+[0.4.4]: https://github.com/ericjuta/omp-cua-jev/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/ericjuta/omp-cua-jev/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/ericjuta/omp-cua-jev/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/ericjuta/omp-cua-jev/compare/v0.4.0...v0.4.1
