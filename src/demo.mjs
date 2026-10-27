@@ -304,8 +304,8 @@ export async function runDemo({ judge = unavailableJudge, onProgress, binary = '
       accepted: false, receipt: null, verification: null };
     native.actions.push(action);
     await at(tool, async () => {
-      // Driver 0.30 adds a free-text root summary; it is native prose, not receipt evidence.
-      const { summary, ...receipt } = await driver.call(tool, args);
+      // Summary and adapter guidance are not receipt evidence.
+      const { summary, hint, ...receipt } = await driver.call(tool, args);
       requireThat((summary === undefined || typeof summary === 'string') && positiveReply(receipt) && receipt.effect === 'unverifiable'
         && record(receipt.delivery) && receipt.delivery.mode === 'background', 'ACTION_RECEIPT_MISMATCH', true);
       if (fill) {
@@ -462,7 +462,7 @@ export async function runDemo({ judge = unavailableJudge, onProgress, binary = '
           step: entry.step, observationId: entry.observationId, candidateId: entry.candidateId ?? null,
           status: entry.status, startedAt: entry.startedAt, finishedAt: entry.finishedAt,
           // Decision provenance as recorded by runBounded; deterministic scores stay null, absent keys stay absent.
-          ...Object.fromEntries(['source', 'confidence', 'probability', 'deterministicDeclined']
+          ...Object.fromEntries(['source', 'confidence', 'probability', 'deterministicDeclined', 'delivery', 'verification', 'verificationObservationId']
             .filter(key => Object.hasOwn(entry, key)).map(key => [key, entry[key]])),
         })),
       } },

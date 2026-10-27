@@ -117,6 +117,15 @@ const UNSUPPORTED_HINT = 'Visual regions are unavailable for this target or plat
 const EXTENSION_PROVENANCE_HINT = 'Stop using the extension for this task. An operator inspects its installed version and provenance; do not install or update it from here.';
 const FRAME_HINT = 'Use a supported capture size or narrow the request; never rescale regions or coordinates yourself.';
 const PARTIAL_HINT = 'Do not act from a partial result; observe again before any bounded retry.';
+// Driver 0.37/0.38 annotate action results with untrusted hint and next_call fields.
+// These fields may recommend a different route or contain request-derived data. Never forward them.
+const ACTION_TOOLS = new Set([
+  'click', 'double_click', 'right_click', 'scroll', 'drag', 'mouse_drag', 'parallel_mouse_drag',
+  'move_cursor', 'mouse_button_down', 'mouse_button_up', 'type_text', 'type_text_chars',
+  'press_key', 'hotkey', 'set_value', 'set_window_frame', 'invoke_menu', 'browser_click',
+  'browser_pointer', 'browser_type', 'browser_select', 'browser_set_input_files',
+]);
+const UNCONFIRMED_HINT = 'The action outcome is not confirmed. Observe the authorized target and verify the effect; do not replay or switch routes automatically.';
 // Exit 75 is the Driver's OS permission gate even when no receipt parses.
 const PERMISSION_EXIT_CODE = 75;
 const PERMISSION_HINT = 'The macOS permission gate did not admit this call. Run skill cua-driver-tcc-gate-fix; do not bypass the gate.';
@@ -141,6 +150,11 @@ const REFUSAL_HINTS = new Map([
   ['permission_required', PERMISSION_HINT],
   ['stale_element_token', 'The element token belongs to an older snapshot or runtime. Read get_window_state in THIS session and use a new element_token from it; do not replay automatically.'],
   ['invalid_arguments', 'The tool rejected the argument shape. Check the request against cua-driver describe for this tool (Driver 0.31.0+ element actions accept only element_token); do not resend the same arguments.'],
+  ['browser_ref_stale', 'Read the authorized page again for fresh references; do not replay automatically.'],
+  ['browser_binding_stale', 'Inspect the authorized browser window and its current binding; do not reconnect or switch routes automatically.'],
+  ['browser_input_incomplete', 'Input may have been partially delivered. Read the authorized page and verify its state; do not replay automatically.'],
+  ['background_unavailable', 'Background delivery is unavailable. Inspect the authorized target; this refusal does not authorize another route.'],
+  ['foreground_unavailable', 'Foreground delivery is unavailable. Inspect the exact authorized window; do not replay or switch routes automatically.'],
   ['not_installed', NOT_INSTALLED_HINT],
   ['unsupported_target', UNSUPPORTED_HINT],
   ['unsupported_platform', UNSUPPORTED_HINT],
@@ -583,12 +597,23 @@ export function createCuaDriver(options = {}) {
       // Session-aware tools carry their label in JSON, never a CLI flag.
       const output = await invoke(binary, ['call', tool, payload], requestTimeoutMs);
       exitCode = output.exitCode;
-      const receipt = JSON.parse(output.stdout);
+      let receipt = JSON.parse(output.stdout);
+      const annotated = ACTION_TOOLS.has(tool) && isRecord(receipt) &&
+        (Object.hasOwn(receipt, 'hint') || Object.hasOwn(receipt, 'next_call'));
+      if (ACTION_TOOLS.has(tool) && isRecord(receipt)) {
+        // Drop even malformed annotations before validating the original action shape. The
+        // generated hint is based only on the effect, never the native text or suggested call.
+        const { hint: _hint, next_call: _nextCall, ...action } = receipt;
+        receipt = action;
+      }
       if (output.failed || !accepts(receipt, tool, session, requestArgs)) {
         const root = isRecord(receipt) ? receipt : undefined;
         refusalCode = [root?.refusal, root?.error, root]
           .map(source => isRecord(source) && Object.hasOwn(source, 'code') ? source.code : undefined)
           .find(code => typeof code === 'string');
+        if (ACTION_TOOLS.has(tool) && (root?.effect === 'unverifiable' || root?.effect === 'suspected_noop' || root?.effect === 'partial')) {
+          hint = UNCONFIRMED_HINT;
+        }
         throw failure(true);
       }
       if (kind === 'resume') {
@@ -608,6 +633,9 @@ export function createCuaDriver(options = {}) {
         }
       }
       // Acceptance is not authorization or proof of a native application's task outcome.
+      if (annotated && (receipt.effect === 'unverifiable' || receipt.effect === 'suspected_noop' || receipt.effect === 'partial')) {
+        receipt.hint = UNCONFIRMED_HINT;
+      }
       if (kind === 'size') {
         const { width, height, scale_factor } = receipt;
         return Object.freeze({ width, height, scale_factor });

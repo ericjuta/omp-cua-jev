@@ -104,6 +104,53 @@ function assertPrivateFailure(error, { refusalCode, exitCode, hint = false, unkn
   return true;
 }
 
+test('0.37 and 0.38 recovery annotations are replaced with safe guidance without extra dispatches', async t => {
+  const session = 'owned-recovery-hints';
+  const secret = 'private-sentinel Bearer token https://private.invalid';
+  const next_call = { tool: 'browser_prepare', arguments: { strategy: { kind: 'existing_profile' }, secret } };
+  const { driver, dispatches } = await createFixture(t, session, [
+    { tool: 'start_session', receipt: { session, active: true } },
+    { tool: 'browser_click', receipt: { effect: 'unverifiable', route: 'trusted_input', delivery: { mode: 'background' }, hint: secret, next_call } },
+    { tool: 'browser_type', receipt: { effect: 'unverifiable', route: 'trusted_input', delivery: { mode: 'background', delivered_count: 2 }, hint: { secret }, next_call } },
+    { tool: 'click', receipt: { effect: 'confirmed', route: 'accessibility', hint: secret, next_call } },
+    { tool: 'click', receipt: { effect: 'refused', code: 'stale_element_token', hint: secret, next_call } },
+    { tool: 'browser_click', receipt: { effect: 'suspected_noop', route: 'trusted_input', delivery: { mode: 'background' }, hint: secret, next_call } },
+    { tool: 'browser_click', receipt: { effect: 'unverifiable', route: 'trusted_input', delivery: { mode: 'background' }, hint: secret, next_call, extra: secret } },
+    { tool: 'click', receipt: { effect: 'refused', code: secret, hint: secret, next_call } },
+    { tool: 'end_session', receipt: { session, active: false } },
+  ]);
+  await driver.start();
+  for (const [tool, args] of [['browser_click', {}], ['browser_type', { text: 'ok' }]]) {
+    const result = await driver.call(tool, args);
+    assert.match(result.hint, /observe.*verify.*do not replay/i);
+    assert.equal(result.next_call, undefined);
+    assert.doesNotMatch(inspect(result, { depth: null }), /private-sentinel|Bearer|private\.invalid/);
+  }
+  const confirmed = await driver.call('click', {});
+  assert.equal(confirmed.hint, undefined);
+  assert.equal(confirmed.next_call, undefined);
+  await assert.rejects(driver.call('click', {}), error => {
+    assertPrivateFailure(error, { refusalCode: 'stale_element_token', hint: true });
+    assert.match(error.hint, /get_window_state.*do not replay automatically/i);
+    return true;
+  });
+  await assert.rejects(driver.call('browser_click', {}), error => {
+    assertPrivateFailure(error, { hint: true });
+    assert.match(error.hint, /observe.*verify.*do not replay/i);
+    return true;
+  });
+  await assert.rejects(driver.call('browser_click', {}), error => {
+    assertPrivateFailure(error, { hint: true });
+    return true;
+  });
+  await assert.rejects(driver.call('click', {}), error => assertPrivateFailure(error));
+  await driver.end();
+  assert.deepEqual((await dispatches()).map(call => call.tool), [
+    'start_session', 'browser_click', 'browser_type', 'click', 'click', 'browser_click',
+    'browser_click', 'click', 'end_session',
+  ]);
+});
+
 // Mutation targets: drop a safe code/hint, copy native fields, or ignore the child's exit code.
 test('scope and typed-browser refusals expose safe hints without request or process secrets', async t => {
   const session = 'owned-safe-hints';
