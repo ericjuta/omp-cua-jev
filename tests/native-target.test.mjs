@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { runInNewContext } from 'node:vm';
 import { JOURNAL_SCHEMA, journalDirectory, readEntry, writeEntry } from '../src/journal.mjs';
 import { createNativeTarget } from '../src/native-target.mjs';
 import { runBounded } from '../src/jev-loop.mjs';
@@ -403,6 +404,292 @@ test('max_image_dimension admits 0 for native resolution and rejects other non-n
   }
   const captures = (await fixture.dispatches()).filter(call => call.tool === 'get_window_state');
   assert.deepEqual(captures.map(call => call.args.max_image_dimension), [0]);
+});
+
+test('content wait polls only the exact AX target until caller readiness and keeps only the ready observation', async t => {
+  const ax = receipt => ({ tool: 'get_window_state', receipt });
+  const fixture = await createFixture(t, [start,
+    ax(windowState({ elements: [], elements_complete: false, snapshot_id: 'empty' })),
+    ax(windowState({ snapshot_id: 'ready' })), { tool: 'click', receipt: axDelivered }, end]);
+  const seen = [];
+  try {
+    await fixture.target.start();
+    const result = await fixture.target.waitForContent({
+      maxMs: 10000, intervalMs: 1, query: 'receipt',
+      ready: observation => {
+        seen.push(observation);
+        return { status: observation.state.elements.some(element => element.label === 'Save receipt')
+          ? 'ready' : 'wait_for_content' };
+      },
+    });
+    assert.equal(result.status, 'ready');
+    assert.equal(result.samples, 2);
+    assert.equal(result.observation, seen[1]);
+    assert.equal(seen[0].state.coverage.elements_complete, false);
+    await rejectsWithoutDispatch(fixture, () => fixture.target.execute(save, seen[0]));
+    // A failed execute invalidates evidence too, so use a fresh wait in other cases to act.
+  } finally {
+    await fixture.target.end();
+  }
+  const calls = await fixture.dispatches();
+  assert.deepEqual(calls.map(call => call.tool), ['start_session', 'get_window_state', 'get_window_state', 'end_session']);
+  for (const call of calls.filter(call => call.tool === 'get_window_state')) {
+    assert.equal(call.args.pid, 4107);
+    assert.equal(call.args.window_id, 71);
+    assert.equal(call.args.query, 'receipt');
+    assert.equal(call.args.include_accessibility_tree, true);
+    assert.equal(call.args.include_screenshot, false);
+    assert.equal(Object.hasOwn(call.args, 'screenshot_out_file'), false);
+  }
+});
+
+test('content wait admits the ready AX observation without focusing or escalating', async t => {
+  const fixture = await createFixture(t, [start, { tool: 'get_window_state', receipt: windowState() },
+    { tool: 'click', receipt: axDelivered }, end]);
+  try {
+    await fixture.target.start();
+    const result = await fixture.target.waitForContent({ maxMs: 10000, ready: () => ({ status: 'ready' }) });
+    assert.equal(result.status, 'ready');
+    assert.deepEqual(await fixture.target.execute(save, result.observation), axDelivered);
+  } finally { await fixture.target.end(); }
+  assert.deepEqual((await fixture.dispatches()).map(call => call.tool),
+    ['start_session', 'get_window_state', 'click', 'end_session']);
+});
+
+test('content readiness explicitly stops or requests foreground without action authority', async t => {
+  for (const status of ['foreground_required', 'stop']) {
+    await t.test(status, async t => {
+      const fixture = await createFixture(t, [start, { tool: 'get_window_state', receipt: windowState() }, end], { foreground: true });
+      try {
+        await fixture.target.start();
+        const result = await fixture.target.waitForContent({ maxMs: 10000, ready: () => ({ status, reason: 'needs review' }) });
+        assert.equal(result.status, status);
+        assert.equal(result.reason, 'needs review');
+        assert.equal(result.samples, 1);
+        await rejectsWithoutDispatch(fixture, () => fixture.target.execute(save, result.observation));
+      } finally { await fixture.target.end(); }
+      assert.deepEqual((await fixture.dispatches()).map(call => call.tool), ['start_session', 'get_window_state', 'end_session']);
+    });
+  }
+});
+
+test('content wait honors deadline and cancellation before and after in-flight work', async t => {
+  const fixture = await createFixture(t, [start,
+    { tool: 'get_window_state', receipt: windowState(), delayMs: 100 },
+    { tool: 'get_window_state', receipt: windowState() }, end]);
+  try {
+    await fixture.target.start();
+    const cancelled = new AbortController();
+    cancelled.abort();
+    assert.deepEqual(await fixture.target.waitForContent({ ready: () => ({ status: 'ready' }), maxMs: 0 }),
+      { status: 'wait_for_content', reason: 'deadline_exceeded', observation: null, samples: 0 });
+    assert.deepEqual(await fixture.target.waitForContent({ ready: () => ({ status: 'ready' }), signal: cancelled.signal }),
+      { status: 'stop', reason: 'cancelled', observation: null, samples: 0 });
+    let calls = 0;
+    const late = await fixture.target.waitForContent({ maxMs: 20, ready: () => { calls++; return { status: 'ready' }; } });
+    assert.equal(late.status, 'wait_for_content');
+    assert.equal(late.reason, 'deadline_exceeded');
+    assert.equal(late.samples, 1);
+    assert.equal(calls, 0);
+    await rejectsWithoutDispatch(fixture, () => fixture.target.execute(save, late.observation));
+    const controller = new AbortController();
+    const stopped = await fixture.target.waitForContent({ maxMs: 10000, signal: controller.signal, ready: async () => {
+      await Promise.resolve(); controller.abort(); return { status: 'ready' };
+    } });
+    assert.equal(stopped.status, 'stop');
+    assert.equal(stopped.reason, 'cancelled');
+    assert.equal(stopped.samples, 1);
+    await rejectsWithoutDispatch(fixture, () => fixture.target.execute(save, stopped.observation));
+  } finally { await fixture.target.end(); }
+  assert.deepEqual((await fixture.dispatches()).map(call => call.tool),
+    ['start_session', 'get_window_state', 'get_window_state', 'end_session']);
+});
+
+test('content wait serializes concurrent operations and awaits callback cancellation', async t => {
+  const fixture = await createFixture(t, [start, { tool: 'get_window_state', receipt: windowState() }, end]);
+  const controller = new AbortController();
+  let release, entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const inReady = new Promise(resolve => { entered = resolve; });
+  try {
+    await fixture.target.start();
+    const pending = fixture.target.waitForContent({ maxMs: 10000, signal: controller.signal, ready: async () => {
+      entered();
+      await gate;
+      return { status: 'ready' };
+    } });
+    await inReady;
+    await rejectsWithoutDispatch(fixture, () => fixture.target.observe());
+    controller.abort();
+    release();
+    const result = await pending;
+    assert.equal(result.status, 'stop');
+    assert.equal(result.reason, 'cancelled');
+    await rejectsWithoutDispatch(fixture, () => fixture.target.execute(save, result.observation));
+  } finally { release(); await fixture.target.end(); }
+  assert.deepEqual((await fixture.dispatches()).map(call => call.tool), ['start_session', 'get_window_state', 'end_session']);
+});
+
+test('content wait cancels during polling and releases the target promptly', async t => {
+  for (const kind of ['abort signal', 'flag-only signal']) {
+    await t.test(kind, async t => {
+      const fixture = await createFixture(t, [start,
+        { tool: 'get_window_state', receipt: windowState() },
+        { tool: 'get_window_state', receipt: windowState() }, end]);
+      const controller = new AbortController();
+      const signal = kind === 'abort signal' ? controller.signal : { aborted: false };
+      const cancel = () => { if (kind === 'abort signal') controller.abort(); else signal.aborted = true; };
+      let entered, observed, pending, timeout;
+      const inReady = new Promise(resolve => { entered = resolve; });
+      try {
+        await fixture.target.start();
+        pending = fixture.target.waitForContent({
+          maxMs: 10000, intervalMs: 4000, signal,
+          ready: value => { observed = value; entered(); return { status: 'wait_for_content' }; },
+        });
+        await inReady;
+        // Allow the readiness result to be processed and the delay to begin.
+        await new Promise(resolve => setImmediate(resolve));
+        await rejectsWithoutDispatch(fixture, () => fixture.target.observe());
+        cancel();
+        const result = await Promise.race([pending, new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error('Cancellation did not interrupt the polling delay.')), 1500);
+        })]);
+        clearTimeout(timeout);
+        assert.deepEqual(result, { status: 'stop', reason: 'cancelled', observation: observed, samples: 1 });
+        await rejectsWithoutDispatch(fixture, () => fixture.target.execute(save, observed));
+        const next = await fixture.target.observe();
+        assert.equal(next.local.pid, 4107);
+        assert.equal(next.local.window_id, 71);
+      } finally {
+        clearTimeout(timeout);
+        cancel();
+        if (pending) await pending.catch(() => {});
+        await fixture.target.end();
+      }
+      assert.deepEqual((await fixture.dispatches()).map(call => call.tool),
+        ['start_session', 'get_window_state', 'get_window_state', 'end_session']);
+    });
+  }
+});
+
+test('content wait converts an abort-aware readiness rejection to cancellation only when aborted', async t => {
+  const fixture = await createFixture(t, [start,
+    { tool: 'get_window_state', receipt: windowState() },
+    { tool: 'get_window_state', receipt: windowState() },
+    { tool: 'get_window_state', receipt: windowState() }, end]);
+  const controller = new AbortController();
+  const failure = new Error('readiness failed');
+  let entered, observed, pending;
+  const inReady = new Promise(resolve => { entered = resolve; });
+  try {
+    await fixture.target.start();
+    pending = fixture.target.waitForContent({ maxMs: 10000, signal: controller.signal, ready: value => {
+      observed = value;
+      return new Promise((_, reject) => {
+        controller.signal.addEventListener('abort', () => reject(failure), { once: true });
+        entered();
+      });
+    } });
+    await inReady;
+    controller.abort();
+    assert.deepEqual(await pending, { status: 'stop', reason: 'cancelled', observation: observed, samples: 1 });
+    await rejectsWithoutDispatch(fixture, () => fixture.target.execute(save, observed));
+    const synchronous = new AbortController();
+    let synchronousObservation;
+    const stopped = await fixture.target.waitForContent({ maxMs: 10000, signal: synchronous.signal, ready: value => {
+      synchronousObservation = value;
+      synchronous.abort();
+      throw failure;
+    } });
+    assert.deepEqual(stopped, { status: 'stop', reason: 'cancelled', observation: synchronousObservation, samples: 1 });
+    await rejectsWithoutDispatch(fixture, () => fixture.target.execute(save, synchronousObservation));
+    let failedObservation;
+    await assert.rejects(() => fixture.target.waitForContent({ maxMs: 10000, signal: new AbortController().signal,
+      ready: value => { failedObservation = value; throw failure; } }), error => error === failure);
+    await rejectsWithoutDispatch(fixture, () => fixture.target.execute(save, failedObservation));
+  } finally {
+    controller.abort();
+    if (pending) await pending.catch(() => {});
+    await fixture.target.end();
+  }
+  assert.deepEqual((await fixture.dispatches()).map(call => call.tool),
+    ['start_session', 'get_window_state', 'get_window_state', 'get_window_state', 'end_session']);
+});
+
+test('content wait reobserves stale ready evidence before admitting an AX action', async t => {
+  const fixture = await createFixture(t, [start,
+    { tool: 'get_window_state', receipt: windowState({ snapshot_id: 'stale' }) },
+    { tool: 'get_window_state', receipt: windowState({ snapshot_id: 'fresh' }) },
+    { tool: 'click', receipt: axDelivered }, end], { maxAgeMs: 200 });
+  const seen = [];
+  try {
+    await fixture.target.start();
+    const result = await fixture.target.waitForContent({ maxMs: 10000, intervalMs: 1, ready: async observation => {
+      seen.push(observation);
+      if (seen.length === 1) await new Promise(resolve => setTimeout(resolve, 250));
+      return { status: 'ready' };
+    } });
+    assert.equal(result.status, 'ready');
+    assert.equal(result.samples, 2);
+    assert.equal(result.observation, seen[1]);
+    assert.notEqual(result.observation, seen[0]);
+    assert.deepEqual(await fixture.target.execute(save, result.observation), axDelivered);
+    await rejectsWithoutDispatch(fixture, () => fixture.target.execute(save, seen[0]));
+  } finally { await fixture.target.end(); }
+  assert.deepEqual((await fixture.dispatches()).map(call => call.tool),
+    ['start_session', 'get_window_state', 'get_window_state', 'click', 'end_session']);
+});
+
+test('content wait does not admit readiness resolved after the deadline', async t => {
+  const fixture = await createFixture(t, [start, { tool: 'get_window_state', receipt: windowState() }, end]);
+  let observed;
+  try {
+    await fixture.target.start();
+    const result = await fixture.target.waitForContent({ maxMs: 1000, ready: async value => {
+      observed = value;
+      await new Promise(resolve => setTimeout(resolve, 1100));
+      return { status: 'ready' };
+    } });
+    assert.deepEqual(result, { status: 'wait_for_content', reason: 'deadline_exceeded', observation: observed, samples: 1 });
+    await rejectsWithoutDispatch(fixture, () => fixture.target.execute(save, observed));
+  } finally { await fixture.target.end(); }
+  assert.deepEqual((await fixture.dispatches()).map(call => call.tool), ['start_session', 'get_window_state', 'end_session']);
+});
+
+test('content wait deadline never returns stale ready evidence as actionable', async t => {
+  const fixture = await createFixture(t, [start, { tool: 'get_window_state', receipt: windowState() }, end], { maxAgeMs: 50 });
+  let observed;
+  try {
+    await fixture.target.start();
+    const result = await fixture.target.waitForContent({ maxMs: 1000, intervalMs: 5000, ready: async value => {
+      observed = value;
+      await new Promise(resolve => setTimeout(resolve, 100));
+      return { status: 'ready' };
+    } });
+    assert.deepEqual(result, { status: 'wait_for_content', reason: 'deadline_exceeded', observation: observed, samples: 1 });
+    await rejectsWithoutDispatch(fixture, () => fixture.target.execute(save, observed));
+  } finally { await fixture.target.end(); }
+  assert.deepEqual((await fixture.dispatches()).map(call => call.tool), ['start_session', 'get_window_state', 'end_session']);
+});
+
+test('content wait rejects malformed decisions and invalid AX modes without dispatching actions', async t => {
+  const decisions = [true, {}, runInNewContext("Object.prototype.status = 'ready'; ({})"),
+    { status: 'ready', extra: true }, { status: 'unknown' }, { status: 'ready', reason: '' }];
+  const fixture = await createFixture(t, [start, ...decisions.map(() => ({ tool: 'get_window_state', receipt: windowState() })), end]);
+  try {
+    await fixture.target.start();
+    await rejectsWithoutDispatch(fixture, () => fixture.target.waitForContent({ ready: () => ({ status: 'ready' }), screenshot: true }));
+    await rejectsWithoutDispatch(fixture, () => fixture.target.waitForContent({ ready: () => ({ status: 'ready' }), include_accessibility_tree: false }));
+    for (const decision of decisions) {
+      let observation;
+      await assert.rejects(() => fixture.target.waitForContent({ maxMs: 10000, ready: value => { observation = value; return decision; } }),
+        { code: 'NATIVE_TARGET_ERROR', unknownOutcome: false });
+      await rejectsWithoutDispatch(fixture, () => fixture.target.execute(save, observation));
+    }
+  } finally { await fixture.target.end(); }
+  assert.deepEqual((await fixture.dispatches()).map(call => call.tool),
+    ['start_session', ...decisions.map(() => 'get_window_state'), 'end_session']);
 });
 
 test('animated A/B/B captures settle only after a measured consecutive quiet span', async t => {

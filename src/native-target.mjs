@@ -32,6 +32,7 @@ const VISUAL_RESULT_FIELDS = ['capture_id', 'width', 'height', 'sha256', 'action
 const PARSE_TIMEOUT_MS = 45_000;
 const VERIFY_FIELDS = new Set(['expect', 'timeoutMs', 'stableSamples']);
 const VERIFY_STATUSES = new Set(['satisfied', 'unsatisfied', 'unknown']);
+const CONTENT_STATUSES = new Set(['ready', 'wait_for_content', 'foreground_required', 'stop']);
 // Native reason codes only; free-form native text is never returned.
 const REASON_CODE = /^[a-z][a-z0-9_]{0,63}$/;
 const BOUNDS = ['x', 'y', 'width', 'height'];
@@ -204,6 +205,17 @@ function geometry(screenshot) {
  * The file holds original captured bytes until end. AX frames are desktop
  * coordinates, NOT screenshot pixels. Never derive pixel candidates from them.
  *
+ * waitForContent({ready,maxMs=5000,intervalMs=100,signal,...observeOptions})
+ * takes serialized AX-only observations of the exact window. The caller's
+ * readiness callback returns {status,reason?}, with an own status of ready,
+ * wait_for_content, foreground_required, or stop. A deadline returns
+ * wait_for_content/deadline_exceeded; cancellation returns stop/cancelled.
+ * Awaited reads and callbacks are not abandoned, but cancellation interrupts
+ * polling delays. Stale ready evidence is reobserved within the same deadline.
+ * Only a ready result retains current AX evidence; other outcomes do not
+ * authorize an action. No focus or route escalation is performed. Incomplete
+ * AX evidence is not proof of absence.
+ *
  * settle({ready,maxMs=5000,intervalMs=100,stableForMs=600,signal,...observeOptions})
  * requires screenshots, literal ready===true, and consecutive identical full
  * PNG bytes/hash and geometry spanning the quiet interval. This conservative
@@ -309,6 +321,10 @@ export function createNativeTarget(options = {}) {
   let lifecycle = 'new';
   const issued = new WeakSet();
   function invalidate() { generation += 1; current = null; }
+  function fresh(observation, capturedAt) {
+    return performance.now() - capturedAt <= maxAgeMs && Date.now() - observation.observedAt >= 0 &&
+      Date.now() - observation.observedAt <= maxAgeMs;
+  }
   async function operate(callback) {
     requireThat(!busy, 'Concurrent target operation.');
     busy = true;
@@ -354,6 +370,69 @@ export function createNativeTarget(options = {}) {
     issued.add(observation);
     return observation;
   }
+  async function contentDelay(ms, signal) {
+    if (signal === undefined) return delay(ms);
+    if (typeof signal.addEventListener === 'function' && typeof signal.removeEventListener === 'function') {
+      try { await delay(ms, undefined, { signal }); }
+      catch (error) { if (!signal.aborted) throw error; }
+      return;
+    }
+    // Preserve support for flag-only signals, which cannot notify a pending timer.
+    const until = performance.now() + ms;
+    while (!signal.aborted) {
+      const remaining = until - performance.now();
+      if (remaining <= 0) return;
+      await delay(Math.min(remaining, 50));
+    }
+  }
+  async function waitForContent(options = {}) {
+    invalidate();
+    record(options);
+    const { ready, maxMs = 5000, intervalMs = 100, signal, ...readOptions } = options;
+    requireThat(active, 'Session is not active.');
+    requireThat(typeof ready === 'function' && Number.isFinite(maxMs) && maxMs >= 0 && maxMs <= 2 ** 31 - 1 &&
+      Number.isFinite(intervalMs) && intervalMs > 0 && intervalMs <= 2 ** 31 - 1 &&
+      (signal === undefined || typeof signal?.aborted === 'boolean') &&
+      (readOptions.screenshot === undefined || readOptions.screenshot === false) &&
+      (readOptions.include_accessibility_tree === undefined || readOptions.include_accessibility_tree === true), 'Invalid content wait options.');
+    observationOptions({ ...readOptions, screenshot: false, include_accessibility_tree: true });
+    const deadline = performance.now() + maxMs;
+    let observation = null, samples = 0, admitted = false;
+    const finish = (status, reason) => ({ status, ...(reason === undefined ? {} : { reason }), observation, samples });
+    try {
+      for (;;) {
+        if (signal?.aborted) return finish('stop', 'cancelled');
+        if (performance.now() >= deadline) return finish('wait_for_content', 'deadline_exceeded');
+        observation = await capture({ ...readOptions, screenshot: false, include_accessibility_tree: true });
+        samples += 1;
+        if (signal?.aborted) return finish('stop', 'cancelled');
+        if (performance.now() >= deadline) return finish('wait_for_content', 'deadline_exceeded');
+        let decisionValue;
+        try { decisionValue = await ready(observation); }
+        catch (error) {
+          if (signal?.aborted) return finish('stop', 'cancelled');
+          throw error;
+        }
+        if (signal?.aborted) return finish('stop', 'cancelled');
+        if (performance.now() >= deadline) return finish('wait_for_content', 'deadline_exceeded');
+        const decision = record(decisionValue);
+        requireThat(Object.keys(decision).every(key => key === 'status' || key === 'reason') &&
+          own(decision, 'status') && CONTENT_STATUSES.has(decision.status) &&
+          (!own(decision, 'reason') || (typeof decision.reason === 'string' && decision.reason.length > 0 &&
+            decision.reason.length <= 200)), 'Invalid content readiness result.');
+        if (decision.status !== 'wait_for_content') {
+          if (decision.status !== 'ready' || fresh(observation, current.capturedAt)) {
+            admitted = decision.status === 'ready';
+            return finish(decision.status, decision.reason);
+          }
+          invalidate();
+        }
+        await contentDelay(Math.min(intervalMs, Math.max(0, deadline - performance.now())), signal);
+      }
+    } finally {
+      if (!admitted) invalidate();
+    }
+  }
   async function settle(options = {}) {
     record(options);
     const { ready, maxMs = 5000, intervalMs = 100, stableForMs = 600, signal, ...readOptions } = options;
@@ -393,8 +472,7 @@ export function createNativeTarget(options = {}) {
   async function execute(candidate, observation) {
     try {
       requireThat(active && current?.observation === observation && current.generation === generation &&
-        performance.now() - current.capturedAt <= maxAgeMs && Date.now() - observation.observedAt >= 0 &&
-        Date.now() - observation.observedAt <= maxAgeMs, 'Observation is stale or foreign.');
+        fresh(observation, current.capturedAt), 'Observation is stale or foreign.');
       const { tool, args } = record(record(candidate).action);
       requireThat(own(ACTION_FIELDS, tool), 'Unsupported native action.');
       record(args);
@@ -614,6 +692,7 @@ export function createNativeTarget(options = {}) {
       return driver.bringToFront({ pid, window_id: windowId });
     }); },
     observe(options = {}) { return operate(() => capture(options)); },
+    waitForContent(options) { return operate(() => waitForContent(options)); },
     settle(options) { return operate(() => settle(options)); },
     verify(options) { return operate(() => verify(options)); },
     regions(observation, options) { return operate(() => regions(observation, options)); },

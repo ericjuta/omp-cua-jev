@@ -1,3 +1,4 @@
+import { setTimeout as delay } from 'node:timers/promises';
 import { isProxy } from 'node:util/types';
 
 const objectPrototypes = new WeakSet([Object.prototype]);
@@ -197,8 +198,13 @@ export async function chooseAction(options) {
 /**
  * All callbacks run directly here and may return promises. observe supplies a
  * fresh target-scoped snapshot; getCandidates supplies complete local actions.
- * isDone, authorize and verify must return literal booleans from independent
- * app evidence, user scope and postconditions respectively. execute must throw
+ * ready may return {status, reason?}, with status 'ready', 'wait_for_content',
+ * 'foreground_required', or 'stop' and an optional non-empty reason of at most
+ * 200 characters. It defaults
+ * to ready. wait_for_content yields to the event loop before a bounded guard
+ * reobservation; foreground_required and stop terminate without taking action.
+ * isDone, authorize and verify return literal booleans from independent app
+ * evidence, user scope and postconditions respectively. execute must throw
  * unless the transport positively accepted the action; its return is not proof.
  * deterministicId(observation, candidates) returns a candidate ID, null, or a
  * declined record { id: null, reason } (non-empty, at most 200 characters); the
@@ -212,20 +218,29 @@ export async function chooseAction(options) {
  * maxMs is a monotonic admission deadline, not provider cancellation or a spend
  * cap. Awaited callbacks can outlive it; no timeout races or retries are used.
  * Once execute is admitted, failure or interruption before verification returns
- * unknown. The next iteration reuses the verified after-snapshot, never a second
- * pre-action snapshot. Status is complete, limit, no_progress, abstained, denied,
- * unverified or unknown. History retains the last four decision summaries; each
+ * unknown. An unready or stale after-snapshot returns unverified without replay.
+ * The next iteration reuses the verified after-snapshot, reobserving if it becomes
+ * stale before completion. Status is complete, limit, no_progress, abstained,
+ * denied, unverified, unknown, foreground_required or stop. A terminal readiness
+ * result and a wait ending at a limit, no-progress cap, or cancellation are
+ * returned as readiness.
+ * History retains the last four decision summaries; each
  * decided entry has source 'judge', 'deterministic' or 'guard' (as chooseAction,
  * plus 'guard' for a pick that went stale after authorize), and chosen actions
- * also keep confidence and probability (null when deterministic). The judge
+ * also keep confidence and probability (null when deterministic). After execute
+ * returns, delivery is 'accepted'; after verify returns, verification is 'passed'
+ * or 'failed', with verificationObservationId identifying the after-snapshot.
+ * Missing evidence means not established, not necessarily failure.
+ * Cleanup is owned by the caller and is not represented by this loop. The judge
  * still sees only observationId, candidateId and status from that history.
  */
 export async function runBounded(options) {
-  const { observe, getCandidates, isDone, authorize, execute, verify, deterministicId,
+  const { observe, getCandidates, isDone, authorize, execute, verify, deterministicId, ready,
     maxSteps = 6, maxReobserves = 3, maxMs = 60000 } = options;
   const policy = choicePolicy(options);
   if ([observe, getCandidates, isDone, authorize, execute, verify].some(callback => typeof callback !== 'function')
     || (deterministicId !== undefined && typeof deterministicId !== 'function')
+    || (ready !== undefined && typeof ready !== 'function')
     || !Number.isSafeInteger(maxSteps) || maxSteps < 0 || !Number.isSafeInteger(maxReobserves) || maxReobserves < 1
     || !Number.isFinite(maxMs) || maxMs < 0) {
     throw new TypeError('Invalid loop callbacks or limits');
@@ -238,6 +253,7 @@ export async function runBounded(options) {
   let entry = null;
   let admitted = false;
   let boundaryStatus;
+  let waitingReadiness;
   function check() {
     if (policy.signal?.aborted) boundaryStatus = 'abstained';
     else if (performance.now() >= deadline) boundaryStatus = 'limit';
@@ -257,9 +273,9 @@ export async function runBounded(options) {
     history.push(Object.freeze(entry));
     entry = null;
   }
-  function finish(status) {
+  function finish(status, readiness) {
     record(status);
-    return { status, steps, history };
+    return readiness ? { status, steps, history, readiness } : { status, steps, history };
   }
   // Records a reobserve decision; true once the consecutive streak reaches maxReobserves.
   function reobserve(source) {
@@ -271,9 +287,47 @@ export async function runBounded(options) {
     if (typeof value !== 'boolean') throw new TypeError('Callback must return a boolean');
     return value;
   }
+  async function readinessOf(observation) {
+    const readiness = await call(ready, observation);
+    if (!(hasFields(readiness, ['status']) || hasFields(readiness, ['status', 'reason']))) {
+      throw new TypeError('Invalid readiness result');
+    }
+    const status = Object.getOwnPropertyDescriptor(readiness, 'status').value;
+    const reason = Object.getOwnPropertyDescriptor(readiness, 'reason');
+    if (!['ready', 'wait_for_content', 'foreground_required', 'stop'].includes(status)
+      || (reason && (!isText(reason.value) || reason.value.length > 200))) {
+      throw new TypeError('Invalid readiness result');
+    }
+    return reason ? { status, reason: reason.value } : { status };
+  }
   try {
     let observation = prepareObservation(await call(observe));
+    let verifiedAfter = null;
     for (;;) {
+      if (ready) {
+        const readiness = await readinessOf(observation);
+        waitingReadiness = undefined;
+        if (readiness.status === 'wait_for_content') {
+          if (steps >= maxSteps) return finish('limit', readiness);
+          entry = { step: ++steps, observationId: observation.id, startedAt: Date.now() };
+          if (Object.hasOwn(readiness, 'reason')) entry.readinessReason = readiness.reason;
+          if (reobserve('guard')) return finish('no_progress', readiness);
+          if (steps >= maxSteps) return finish('limit', readiness);
+          waitingReadiness = readiness;
+          await call(delay, 0);
+          observation = prepareObservation(await call(observe));
+          continue;
+        }
+        if (readiness.status !== 'ready') return finish(readiness.status, readiness);
+      }
+      if (observation === verifiedAfter && isStale(observation, policy.maxAgeMs)) {
+        if (steps >= maxSteps) return finish('limit');
+        entry = { step: ++steps, observationId: observation.id, startedAt: Date.now() };
+        if (reobserve('guard')) return finish('no_progress');
+        if (steps >= maxSteps) return finish('limit');
+        observation = prepareObservation(await call(observe));
+        continue;
+      }
       if (boolean(await call(isDone, observation))) return finish('complete');
       if (steps >= maxSteps) return finish('limit');
       entry = { step: ++steps, observationId: observation.id, startedAt: Date.now() };
@@ -305,17 +359,35 @@ export async function runBounded(options) {
       check();
       admitted = true;
       await execute(candidate, observation);
+      entry.delivery = 'accepted';
       check();
       const after = prepareObservation(await call(observe));
-      if (!boolean(await call(verify, candidate, observation, after))) return finish('unverified');
+      if (ready) {
+        const readiness = await readinessOf(after);
+        if (readiness.status !== 'ready') {
+          admitted = false;
+          return finish('unverified', readiness);
+        }
+      }
+      check();
+      if (isStale(after, policy.maxAgeMs)) {
+        admitted = false;
+        return finish('unverified');
+      }
+      const verified = boolean(await verify(candidate, observation, after));
+      entry.verification = verified ? 'passed' : 'failed';
+      entry.verificationObservationId = after.id;
+      check();
+      if (!verified) return finish('unverified');
       admitted = false;
       record('verified');
       reobserves = 0;
       observation = after;
+      verifiedAfter = after;
     }
   } catch (error) {
     if (admitted) return finish('unknown');
-    if (error === boundary) return finish(boundaryStatus);
+    if (error === boundary) return finish(boundaryStatus, waitingReadiness);
     throw error;
   }
 }
